@@ -84,12 +84,21 @@ CREATE INDEX IF NOT EXISTS idx_stc_period     ON sales_tax_city(period_year, per
 CREATE INDEX IF NOT EXISTS idx_stcounty_period ON sales_tax_county(period_year, period_month);
 
 -- Seed the watchlist
+-- Patterns are matched with SQL LIKE against mixed_beverage.location_name,
+-- so they must be the exact filing name, not the trading name. Fonda San
+-- Miguel files as 'SAN MIGUEL RESTAURANT' under 'CUISINES OF MEXICO, INC.'
+-- (TABC permit MB091654). Trailing '%' wildcards were removed after they
+-- produced false positives on import.
 INSERT OR IGNORE INTO venue_watchlist (slug, display_name, bucket, match_pattern, notes) VALUES
-    ('fonda_san_miguel', 'Fonda San Miguel',    'home',     'FONDA SAN MIGUEL%',  'Home venue'),
-    ('suerte',           'Suerte',              'mexican',  'SUERTE%',            'Mexican fine dining peer'),
-    ('el_naranjo',       'El Naranjo',          'mexican',  'EL NARANJO%',        'Mexican fine dining peer'),
-    ('comedor',          'Comedor',             'mexican',  'COMEDOR%',           'Mexican fine dining peer'),
-    ('roosevelt_room',   'The Roosevelt Room',  'cocktail', '%ROOSEVELT ROOM%',   'Cocktail-forward peer'),
-    ('pelons',           'Pelons Tex-Mex',      'cocktail', 'PELONS%',            'Cocktail-forward peer'),
-    ('midnight_cowboy',  'Midnight Cowboy',     'cocktail', 'MIDNIGHT COWBOY%',   'Cocktail-forward peer'),
-    ('garage',           'Garage',              'cocktail', 'GARAGE%',            'Cocktail-forward peer; verify match on import');
+    ('fonda_san_miguel', 'Fonda San Miguel', 'home', 'SAN MIGUEL RESTAURANT', 'Home venue'),
+    ('suerte', 'Suerte', 'mexican', 'SUERTE', 'Mexican fine dining peer'),
+    ('el_naranjo', 'El Naranjo', 'mexican', 'EL NARANJO RESTAURANT', 'Mexican fine dining peer'),
+    ('comedor', 'Comedor', 'mexican', 'COMEDOR', 'Mexican fine dining peer'),
+    ('roosevelt_room', 'The Roosevelt Room', 'cocktail', 'THE ROOSEVELT ROOM & THE ELEANOR', 'Cocktail-forward peer'),
+    ('pelons', 'Pelons Tex-Mex', 'cocktail', 'PELONS/508', 'Cocktail-forward peer'),
+    ('garage', 'Garage', 'cocktail', 'GARAGE', 'Cocktail-forward peer; verify match on import'),
+    ('midnight_cowboy', 'Midnight Cowboy', 'cocktail', 'MIDNIGHT COWBOY%', 'Cocktail-forward peer'),
+    ('bulevar', 'Bulevar', 'mexican', 'BULEVAR', 'Added 2026-05'),
+    ('atx_cocina', 'ATX Cocina', 'mexican', 'ATX COCINA', 'Added 2026-05'),
+    ('matts_el_rancho', 'Matt''s El Rancho', 'mexican', 'MATT''S EL RANCHO, INC.', 'Added 2026-05; LLC name doubles as location'),
+    ('de_nada_cantina', 'De Nada Cantina', 'mexican', 'DE NADA CANTINA', 'Added 2026-05');
