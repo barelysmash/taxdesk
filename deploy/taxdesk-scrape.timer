@@ -1,0 +1,13 @@
+[Unit]
+Description=Run taxdesk scraper daily
+Requires=taxdesk-scrape.service
+
+[Timer]
+# Comptroller releases the monthly comparison on the first/second Wed.
+# Daily 06:00 CT runs are plenty; high-water marks keep it cheap.
+OnCalendar=*-*-* 06:00:00 America/Chicago
+Persistent=true
+RandomizedDelaySec=15m
+
+[Install]
+WantedBy=timers.target

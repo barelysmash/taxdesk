@@ -1,0 +1,17 @@
+[Unit]
+Description=taxdesk scraper (Comptroller pull)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=ocelia
+Group=ocelia
+WorkingDirectory=/opt/taxdesk
+EnvironmentFile=-/etc/taxdesk/taxdesk.env
+ExecStart=/opt/taxdesk/.venv/bin/python -m scraper.scrape
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/taxdesk
+PrivateTmp=true

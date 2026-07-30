@@ -1,0 +1,40 @@
+# --- Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+
+# --- Frontend
+web/node_modules/
+web/dist/
+
+# --- Secrets & local config
+# Real env lives at /etc/taxdesk/taxdesk.env on guildenstern, outside the repo.
+.env
+.env.*
+*.env
+!deploy/taxdesk.env.example
+web/.env.local
+
+# --- Data & runtime artifacts
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+schema_probe.json
+
+# Exports produced by scripts/refresh.sh
+*.tgz
+*.tar.gz
+*.csv
+*.xlsx
+
+# --- Editor / OS
+.DS_Store
+Thumbs.db
+*.swp
+*~
+.vscode/
+.idea/

@@ -1,0 +1,27 @@
+[Unit]
+Description=taxdesk API
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ocelia
+Group=ocelia
+WorkingDirectory=/opt/taxdesk
+# Fallbacks first; EnvironmentFile overrides them if present.
+Environment=TAXDESK_BIND_HOST=127.0.0.1
+Environment=TAXDESK_BIND_PORT=8770
+EnvironmentFile=-/etc/taxdesk/taxdesk.env
+ExecStart=/opt/taxdesk/.venv/bin/uvicorn api.main:app \
+    --host ${TAXDESK_BIND_HOST} --port ${TAXDESK_BIND_PORT} \
+    --workers 1 --proxy-headers
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/taxdesk
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

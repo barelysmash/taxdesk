@@ -1,0 +1,16 @@
+# Anything that runs on Linux must keep LF, regardless of core.autocrlf.
+# scripts/refresh.sh is piped into bash on guildenstern; CRLF breaks it.
+* text=auto eol=lf
+
+*.sh        text eol=lf
+*.py        text eol=lf
+*.sql       text eol=lf
+*.service   text eol=lf
+*.timer     text eol=lf
+*.snippet   text eol=lf
+
+# PowerShell stays CRLF — it runs on Windows.
+*.ps1       text eol=crlf
+
+*.png binary
+*.ico binary
