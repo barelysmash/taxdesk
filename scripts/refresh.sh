@@ -27,6 +27,11 @@ PY="$APP_DIR/.venv/bin/python"
 # the handful of early filings that cause the watermark ratchet.
 MIN_FULL_MONTH_ROWS="${MIN_FULL_MONTH_ROWS:-500}"
 
+# Must mirror MB_LOOKBACK_MONTHS in scraper/scrape.py. An incremental pull
+# re-reads back to (max month - this many), so it self-heals any gap shorter
+# than the window. Only a longer gap needs a full backfill.
+MB_LOOKBACK_MONTHS="${MB_LOOKBACK_MONTHS:-6}"
+
 MODE=auto
 KEEP=5
 TABLES=(mixed_beverage sales_tax_city sales_tax_county sales_tax_statewide venue_watchlist)
@@ -80,12 +85,14 @@ if ((${#old[@]})); then
   for f in "${old[@]}"; do sudo rm -f -- "$f"; info "pruned $(basename "$f")"; done
 fi
 
-# -------------------------------------------------------- 2. ratchet detection
-# The incremental scrape queries obligation_end_date > MAX(obligation_end_date).
-# A single early or amended filing lifts that floor above the bulk that posts a
-# month later, and every subsequent run silently ingests nothing. The tell is
-# MAX(month) sitting ahead of the newest fully-reported month.
-say "watermark check"
+# -------------------------------------------------------- 2. coverage check
+# A few venues file early, so MAX(obligation_end_date) normally sits ahead of
+# the newest fully-reported month. That is expected, not a fault: the scraper
+# re-reads a trailing MB_LOOKBACK_MONTHS window and repairs the arrears itself.
+# A full backfill is only required when the gap is longer than that window.
+say "coverage check"
+ym_idx() { local y=${1%%-*} m=${1##*-}; echo $(( 10#$y * 12 + 10#$m - 1 )); }
+
 MAX_YM=$(sq "SELECT substr(MAX(obligation_end_date),1,7) FROM mixed_beverage;")
 LAST_FULL=$(sq "SELECT substr(obligation_end_date,1,7) FROM mixed_beverage
                 GROUP BY 1 HAVING COUNT(*) >= $MIN_FULL_MONTH_ROWS
@@ -93,19 +100,22 @@ LAST_FULL=$(sq "SELECT substr(obligation_end_date,1,7) FROM mixed_beverage
 info "max month        $MAX_YM"
 info "last full month  $LAST_FULL  (>= $MIN_FULL_MONTH_ROWS rows)"
 
-RATCHET=0
-if [[ -n $MAX_YM && -n $LAST_FULL && $MAX_YM != "$LAST_FULL" ]]; then
-  RATCHET=1
-  STRAGGLERS=$(sq "SELECT COUNT(*) FROM mixed_beverage
-                   WHERE substr(obligation_end_date,1,7) > '$LAST_FULL';")
-  warn "watermark ratchet: $STRAGGLERS row(s) sit above $LAST_FULL"
-  warn "incremental pulls will ingest nothing until this is cleared"
+GAP=0
+if [[ -n $MAX_YM && -n $LAST_FULL ]]; then
+  GAP=$(( $(ym_idx "$MAX_YM") - $(ym_idx "$LAST_FULL") ))
+fi
+info "gap              $GAP month(s), lookback window $MB_LOOKBACK_MONTHS"
+
+STALE=0
+if (( GAP > MB_LOOKBACK_MONTHS )); then
+  STALE=1
+  warn "gap exceeds the lookback window — incremental cannot reach $LAST_FULL"
 fi
 
 EFFECTIVE=$MODE
 if [[ $MODE == auto ]]; then
-  if ((RATCHET)); then EFFECTIVE=full; info "auto -> full (ratchet detected)"
-  else                 EFFECTIVE=incremental; info "auto -> incremental"; fi
+  if ((STALE)); then EFFECTIVE=full; info "auto -> full (gap beyond lookback)"
+  else               EFFECTIVE=incremental; info "auto -> incremental"; fi
 fi
 
 # -------------------------------------------------------------------- 3. scrape
@@ -158,10 +168,13 @@ POST_FULL=$(sq "SELECT substr(obligation_end_date,1,7) FROM mixed_beverage
                 ORDER BY 1 DESC LIMIT 1;")
 info ""
 info "complete through $POST_FULL  (max obligation month $POST_MAX)"
-if [[ $POST_MAX != "$POST_FULL" ]]; then
-  warn "stragglers still sit above the last full month"
-  warn "the next INCREMENTAL run will ingest 0 rows — this run must stay --full"
-  warn "permanent fix: lookback window in ingest_mixed_beverage(), not a strict >"
+POST_GAP=$(( $(ym_idx "$POST_MAX") - $(ym_idx "$POST_FULL") ))
+if (( POST_GAP > MB_LOOKBACK_MONTHS )); then
+  warn "gap is $POST_GAP months, beyond the $MB_LOOKBACK_MONTHS-month lookback"
+  warn "re-run with --full to repair, and consider raising MB_LOOKBACK_MONTHS"
+elif (( POST_GAP > 0 )); then
+  info "$POST_GAP month(s) of early filings ahead of $POST_FULL — normal;"
+  info "the trailing lookback will collect the arrears as they post"
 fi
 
 # -------------------------------------------------------------------- 5. export
@@ -180,7 +193,7 @@ host           $(hostname)
 database       $DB
 backup         $BAK
 scrape mode    $EFFECTIVE
-ratchet found  $((RATCHET))
+coverage gap   $GAP month(s)
 complete thru  $POST_FULL
 max obligation $POST_MAX
 mb rows        $(sq "SELECT COUNT(*) FROM mixed_beverage;")
