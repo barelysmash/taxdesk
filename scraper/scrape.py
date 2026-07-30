@@ -23,6 +23,7 @@ import sqlite3
 import sys
 import time
 from contextlib import closing
+from html.parser import HTMLParser
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Iterable, Iterator
@@ -49,22 +50,6 @@ NEWS_INDEX   = "https://comptroller.texas.gov/about/media-center/news/"
 
 PAGE_SIZE = 50_000   # Socrata hard ceiling is 50k per request
 BACKFILL_YEARS = 3
-
-# Incremental pulls re-fetch a trailing window instead of only what is strictly
-# newer than the high-water mark.
-#
-# The strict-'>' approach had a fatal failure mode. A handful of venues file
-# early, so MAX(obligation_end_date) can sit one or two months ahead of the
-# ~1,450 returns that post in arrears. Those real filings then fall permanently
-# BEHIND the watermark and are never fetched, while the run still exits 0. In
-# 2026 this silently froze mixed_beverage at March for ten weeks.
-#
-# Re-reading a trailing window is cheap and safe: every ingest is
-# INSERT OR REPLACE against a natural primary key, so overlap cannot duplicate
-# rows, and amended filings (the Comptroller does revise these) now correct
-# themselves instead of being skipped.
-MB_LOOKBACK_MONTHS = 6
-ALLOC_LOOKBACK_PERIODS = 3
 
 # Cities we actively care about for the City Alloc dataset. Statewide totals
 # stay in the news-release rollup table.
@@ -144,18 +129,6 @@ def _latest_period(conn: sqlite3.Connection, table: str) -> tuple[int, int] | No
     return row if row else None
 
 
-def _shift_period(yr: int, mo: int, delta: int) -> tuple[int, int]:
-    """Shift a (year, month) pair by delta months. Handles year rollover."""
-    idx = yr * 12 + (mo - 1) + delta
-    return idx // 12, idx % 12 + 1
-
-
-def _shift_iso_month(iso_date: str, delta: int) -> str:
-    """Shift an ISO date to the first day of a month delta months away."""
-    yr, mo = _shift_period(int(iso_date[:4]), int(iso_date[5:7]), delta)
-    return f"{yr:04d}-{mo:02d}-01"
-
-
 def _latest_mb_date(conn: sqlite3.Connection) -> str | None:
     row = conn.execute(
         "SELECT MAX(obligation_end_date) FROM mixed_beverage"
@@ -201,12 +174,11 @@ def ingest_city_alloc(conn: sqlite3.Connection, client: httpx.Client,
         " OR ".join(f"upper(city) LIKE '{c}%'" for c in WATCH_CITIES_LIKE)
     ]
     if since_period:
-        # Re-read a few trailing periods rather than only what is strictly
-        # newer, so revised allocations are corrected in place.
+        yr, mo = since_period
+        # Periods strictly newer than the latest we have.
         # Socrata column names: report_year / report_month.
-        yr, mo = _shift_period(*since_period, -ALLOC_LOOKBACK_PERIODS)
         where_parts.append(
-            f"(report_year > {yr} OR (report_year = {yr} AND report_month >= {mo}))"
+            f"(report_year > {yr} OR (report_year = {yr} AND report_month > {mo}))"
         )
     where = " AND ".join(f"({p})" for p in where_parts)
 
@@ -250,9 +222,9 @@ def ingest_county_alloc(conn: sqlite3.Connection, client: httpx.Client,
     )
     where_parts = [name_clause]
     if since_period:
-        yr, mo = _shift_period(*since_period, -ALLOC_LOOKBACK_PERIODS)
+        yr, mo = since_period
         where_parts.append(
-            f"(report_year > {yr} OR (report_year = {yr} AND report_month >= {mo}))"
+            f"(report_year > {yr} OR (report_year = {yr} AND report_month > {mo}))"
         )
     where = " AND ".join(f"({p})" for p in where_parts)
 
@@ -297,11 +269,9 @@ def ingest_mixed_beverage(conn: sqlite3.Connection, client: httpx.Client,
     where_parts = [city_clause]
     if since_date:
         # Column is a datetime despite its name. SoQL wants ISO with quotes.
-        # Back the floor off by MB_LOOKBACK_MONTHS and use '>=' so late and
-        # amended filings behind the high-water mark are still picked up.
-        floor = _shift_iso_month(since_date, -MB_LOOKBACK_MONTHS)
+        since_iso = f"{since_date}T00:00:00.000"
         where_parts.append(
-            f"obligation_end_date_yyyymmdd >= '{floor}T00:00:00.000'"
+            f"obligation_end_date_yyyymmdd > '{since_iso}'"
         )
     else:
         cutoff = (date.today().replace(day=1)
@@ -364,16 +334,85 @@ def ingest_mixed_beverage(conn: sqlite3.Connection, client: httpx.Client,
 # and parse the table inside each.
 # ---------------------------------------------------------------------------
 
+# The index serves absolute URLs. An earlier version of this pattern required a
+# root-relative href and therefore never matched anything.
 RELEASE_URL_RE = re.compile(
-    r'href="(/about/media-center/news/(\d{8})-[^"]*'
+    r'href="((?:https?://(?:www\.)?comptroller\.texas\.gov)?'
+    r'/about/media-center/news/(\d{8})-[^"]*'
     r'distributes[^"]*sales-tax-revenue[^"]*)"',
     re.IGNORECASE,
 )
-TABLE_ROW_RE = re.compile(
-    r"\|\s*(Cities|Transit Systems|Counties|Special Purpose Districts|Total)\s*\|"
-    r"\s*([^|]+?)\s*\|\s*([↑↓]?\s*[\d.]+)%\s*\|\s*([↑↓]?\s*[\d.]+)%\s*\|",
-    re.IGNORECASE,
-)
+
+
+class _TableParser(HTMLParser):
+    """Collect every HTML table as a list of rows, each row a list of cell text.
+
+    Row labels in these releases live in <th> inside <tbody>, not <td>, so both
+    are treated as cells. A regex cannot do this reliably: the previous
+    implementation matched markdown pipe-table syntax against raw HTML, which
+    never matched a single byte, so this table was always empty.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.tables: list[list[list[str]]] = []
+        self._table: list[list[str]] | None = None
+        self._row: list[str] | None = None
+        self._cell: list[str] | None = None
+
+    def handle_starttag(self, tag: str, attrs) -> None:
+        if tag == "table" and self._table is None:
+            self._table = []
+        elif tag == "tr" and self._table is not None:
+            self._row = []
+        elif tag in ("td", "th") and self._row is not None:
+            self._cell = []
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag in ("td", "th") and self._cell is not None and self._row is not None:
+            self._row.append(" ".join("".join(self._cell).split()))
+            self._cell = None
+        elif tag == "tr" and self._row is not None:
+            if self._row and self._table is not None:
+                self._table.append(self._row)
+            self._row = None
+        elif tag == "table" and self._table is not None:
+            self.tables.append(self._table)
+            self._table = None
+
+    def handle_data(self, data: str) -> None:
+        if self._cell is not None:
+            self._cell.append(data)
+
+
+# Recipient label as published -> our column key.
+_ROW_KEYS = {
+    "cities": "cities",
+    "transit systems": "transit",
+    "counties": "counties",
+    "special purpose districts": "spd",
+    "total": "total",
+}
+
+
+def _find_allocation_table(html: str) -> dict[str, list[str]] | None:
+    """Return {lowercased label: [cells after the label]} for the allocation
+    table, identified by containing both a Cities and a Total row."""
+    parser = _TableParser()
+    parser.feed(html)
+    for table in parser.tables:
+        rows = {r[0].strip().lower(): r[1:] for r in table if len(r) >= 2}
+        if "total" in rows and "cities" in rows:
+            return rows
+    return None
+
+
+def _pct(text: str) -> float | None:
+    """Parse a change cell such as '\u21916.1%' or '\u21932.3%' into +6.1 / -2.3."""
+    m = re.search(r"([\u2191\u2193]?)\s*([\d.]+)\s*%", text)
+    if not m:
+        return None
+    return float(m.group(2)) * (-1 if m.group(1) == "\u2193" else 1)
 DOLLAR_RE = re.compile(r"\$([\d.]+)\s*([BM])", re.IGNORECASE)
 MONTH_RE  = re.compile(
     r"sales tax allocations for (\w+),\s*([\d.]+)\s*percent (more|less)",
@@ -409,23 +448,31 @@ def _parse_release(client: httpx.Client, url: str) -> dict | None:
     if m:
         yoy = float(m.group(2)) * (1 if m.group(3).lower() == "more" else -1)
 
+    rows = _find_allocation_table(html)
+    if rows is None:
+        LOG.warning("no allocation table found in %s", url)
+        return None
+
     totals: dict[str, float | None] = {
         "cities": None, "counties": None, "transit": None,
         "spd": None, "total": None,
     }
-    for row in TABLE_ROW_RE.finditer(html):
-        label = row.group(1).lower()
-        dollars = _to_dollars(row.group(2))
-        key = {
-            "cities": "cities",
-            "transit systems": "transit",
-            "counties": "counties",
-            "special purpose districts": "spd",
-            "total": "total",
-        }.get(label)
-        if key: totals[key] = dollars
+    ytd = None
+    for label, cells in rows.items():
+        key = _ROW_KEYS.get(label)
+        if not key:
+            continue
+        totals[key] = _to_dollars(cells[0]) if cells else None
+        if key == "total":
+            # Columns are: allocation, change vs prior year, year-to-date change.
+            if yoy is None and len(cells) > 1:
+                yoy = _pct(cells[1])
+            if len(cells) > 2:
+                ytd = _pct(cells[2])
 
-    if totals["total"] is None: return None
+    if totals["total"] is None:
+        LOG.warning("allocation table in %s had no parsable total", url)
+        return None
 
     return {
         "period_year": pub_year,
@@ -436,14 +483,21 @@ def _parse_release(client: httpx.Client, url: str) -> dict | None:
         "transit_total": totals["transit"],
         "spd_total": totals["spd"],
         "yoy_pct": yoy,
+        "ytd_yoy_pct": ytd,
         "source_url": url,
     }
 
 
 def ingest_statewide(conn: sqlite3.Connection, client: httpx.Client,
-                     max_pages: int = 3) -> int:
+                     years_back: int = 1) -> int:
     """Scan the news index and parse any monthly allocation release we don't
-    already have."""
+    already have.
+
+    The index has no ?page=N parameter — an earlier version passed one, which
+    was silently ignored, so the same 'Latest' page was fetched repeatedly. It
+    paginates by date range instead, and the default view only reaches back
+    about six months, so earlier years need an explicit window.
+    """
     seen: set[str] = set()
     have: set[tuple[int, int]] = {
         (r[0], r[1]) for r in conn.execute(
@@ -451,36 +505,51 @@ def ingest_statewide(conn: sqlite3.Connection, client: httpx.Client,
         )
     }
 
+    this_year = date.today().year
+    index_urls = [NEWS_INDEX] + [
+        f"{NEWS_INDEX}?fromDate={y}-01-01&toDate={y}-12-31"
+        for y in range(this_year, this_year - years_back - 1, -1)
+    ]
+
     n = 0
-    for page in range(1, max_pages + 1):
-        idx_url = f"{NEWS_INDEX}?page={page}" if page > 1 else NEWS_INDEX
+    for idx_url in index_urls:
         resp = client.get(idx_url)
-        if resp.status_code != 200: break
-        for match in RELEASE_URL_RE.finditer(resp.text):
-            href = match.group(1)
-            full = f"https://comptroller.texas.gov{href}"
-            if full in seen: continue
+        if resp.status_code != 200:
+            LOG.warning("news index %s returned %d", idx_url, resp.status_code)
+            continue
+        hrefs = RELEASE_URL_RE.findall(resp.text)
+        LOG.debug("%s -> %d candidate release links", idx_url, len(hrefs))
+        for href, _stamp in hrefs:
+            # The index serves absolute URLs, but tolerate relative ones.
+            full = href if href.startswith("http") else f"https://comptroller.texas.gov{href}"
+            if full in seen:
+                continue
             seen.add(full)
 
-            pub_match = re.search(r"/news/(\d{4})(\d{2})\d{2}-", href)
-            if not pub_match: continue
+            pub_match = re.search(r"/news/(\d{4})(\d{2})\d{2}-", full)
+            if not pub_match:
+                continue
             pub_year, pub_month = int(pub_match.group(1)), int(pub_match.group(2))
-            if (pub_year, pub_month) in have: continue
+            if (pub_year, pub_month) in have:
+                continue
 
             parsed = _parse_release(client, full)
-            if not parsed: continue
+            if not parsed:
+                continue
             conn.execute("""
                 INSERT OR REPLACE INTO sales_tax_statewide
                     (period_year, period_month, total_allocations, cities_total,
                      counties_total, transit_total, spd_total, yoy_pct,
-                     source_url)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     ytd_yoy_pct, source_url)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 parsed["period_year"], parsed["period_month"],
                 parsed["total_allocations"], parsed["cities_total"],
                 parsed["counties_total"], parsed["transit_total"],
-                parsed["spd_total"], parsed["yoy_pct"], parsed["source_url"],
+                parsed["spd_total"], parsed["yoy_pct"],
+                parsed["ytd_yoy_pct"], parsed["source_url"],
             ))
+            have.add((pub_year, pub_month))
             n += 1
             time.sleep(0.5)
     conn.commit()
