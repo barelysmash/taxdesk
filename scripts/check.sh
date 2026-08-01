@@ -95,25 +95,56 @@ grep -q 'idx_mb_city_date_total' "$SCHEMA" && ok "idx_mb_city_date_total declare
 # 9b15112. Trailing '%' patterns matched unrelated venues and inflated totals.
 # Reverted once by a schema.sql built from a stale base.
 say "watchlist (regression: peer totals silently inflated)"
-if command -v sqlite3 >/dev/null 2>&1; then
-  tmp=$(mktemp); rm -f "$tmp"
-  if sqlite3 "$tmp" < "$SCHEMA" 2>/dev/null; then
-    ok "schema.sql executes cleanly"
-    n=$(sqlite3 "$tmp" "SELECT COUNT(*) FROM venue_watchlist;")
-    [[ $n -eq 12 ]] && ok "12 venues seeded" || bad "expected 12 venues, found $n"
-    f=$(sqlite3 "$tmp" "SELECT match_pattern FROM venue_watchlist WHERE slug='fonda_san_miguel';")
-    [[ $f == "SAN MIGUEL RESTAURANT" ]] && ok "fonda pattern is the filing name" \
-      || { bad "fonda pattern is '$f'"; note "must be SAN MIGUEL RESTAURANT, not the trading name"; }
-    # MIDNIGHT COWBOY% is the one known-inert wildcard: that venue files nothing.
-    w=$(sqlite3 "$tmp" "SELECT COUNT(*) FROM venue_watchlist WHERE match_pattern LIKE '%\\%' ESCAPE '\\' AND slug <> 'midnight_cowboy';")
-    [[ $w -eq 0 ]] && ok "no trailing-wildcard patterns" || bad "$w wildcard pattern(s) present"
-    sqlite3 "$tmp" < "$SCHEMA" 2>/dev/null && ok "schema.sql is idempotent" || bad "schema.sql not idempotent"
-  else
-    bad "schema.sql failed to execute"
-  fi
-  rm -f "$tmp"
+# Uses python's sqlite3 module, not the sqlite3 CLI: Git Bash on Windows does
+# not ship the CLI, so the original version skipped this whole section — the
+# exact checks that would have caught the stale-base schema.sql revert — while
+# still reporting "all invariants hold".
+wl_out=$(python - "$SCHEMA" <<'PY' 2>&1
+import sqlite3, sys
+schema = open(sys.argv[1], encoding="utf-8").read()
+def emit(good, msg, hint=""):
+    print(("PASS|" if good else "FAIL|") + msg + ("|" + hint if hint else ""))
+try:
+    c = sqlite3.connect(":memory:")
+    c.executescript(schema)
+except Exception as e:
+    emit(False, "schema.sql failed to execute: %s" % e); sys.exit(0)
+emit(True, "schema.sql executes cleanly")
+
+n = c.execute("SELECT COUNT(*) FROM venue_watchlist").fetchone()[0]
+emit(n == 12, "12 venues seeded" if n == 12 else "expected 12 venues, found %d" % n,
+     "" if n == 12 else "a stale-base schema.sql reverts this to 8")
+
+row = c.execute("SELECT match_pattern FROM venue_watchlist WHERE slug='fonda_san_miguel'").fetchone()
+f = row[0] if row else "<missing>"
+emit(f == "SAN MIGUEL RESTAURANT",
+     "fonda pattern is the filing name" if f == "SAN MIGUEL RESTAURANT" else "fonda pattern is %r" % f,
+     "" if f == "SAN MIGUEL RESTAURANT" else "must be SAN MIGUEL RESTAURANT, not the trading name")
+
+# MIDNIGHT COWBOY% is the one known-inert wildcard: that venue files nothing.
+w = c.execute(r"SELECT COUNT(*) FROM venue_watchlist WHERE match_pattern LIKE '%\%' ESCAPE '\' AND slug <> 'midnight_cowboy'").fetchone()[0]
+emit(w == 0, "no trailing-wildcard patterns" if w == 0 else "%d wildcard pattern(s) present" % w,
+     "" if w == 0 else "'GARAGE%' style patterns match unrelated venues")
+
+idx = {r[0] for r in c.execute("SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='mixed_beverage'")}
+for want in ("idx_mb_upper_city_date", "idx_mb_city_date_total"):
+    emit(want in idx, "%s created by schema.sql" % want)
+
+try:
+    c.executescript(schema)
+    n2 = c.execute("SELECT COUNT(*) FROM venue_watchlist").fetchone()[0]
+    emit(n2 == n, "schema.sql is idempotent" if n2 == n else "re-run changed venue count %d -> %d" % (n, n2))
+except Exception as e:
+    emit(False, "schema.sql is not idempotent: %s" % e)
+PY
+)
+if [[ -z $wl_out ]]; then
+  bad "watchlist checks produced no output (is python on PATH?)"
 else
-  note "sqlite3 not on PATH locally — watchlist checks skipped"
+  while IFS='|' read -r verdict msg hint; do
+    [[ -z ${verdict:-} ]] && continue
+    if [[ $verdict == PASS ]]; then ok "$msg"; else bad "$msg"; [[ -n ${hint:-} ]] && note "$hint"; fi
+  done <<<"$wl_out"
 fi
 
 # ------------------------------------------------------------ 5. hygiene
