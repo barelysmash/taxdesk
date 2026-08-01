@@ -51,6 +51,22 @@ NEWS_INDEX   = "https://comptroller.texas.gov/about/media-center/news/"
 PAGE_SIZE = 50_000   # Socrata hard ceiling is 50k per request
 BACKFILL_YEARS = 3
 
+# Incremental pulls re-fetch a trailing window instead of only what is strictly
+# newer than the high-water mark.
+#
+# The strict-'>' approach had a fatal failure mode. A handful of venues file
+# early, so MAX(obligation_end_date) can sit one or two months ahead of the
+# ~1,450 returns that post in arrears. Those real filings then fall permanently
+# BEHIND the watermark and are never fetched, while the run still exits 0. In
+# 2026 this silently froze mixed_beverage at March for ten weeks.
+#
+# Re-reading a trailing window is cheap and safe: every ingest is
+# INSERT OR REPLACE against a natural primary key, so overlap cannot duplicate
+# rows, and amended filings (the Comptroller does revise these) now correct
+# themselves instead of being skipped.
+MB_LOOKBACK_MONTHS = 6
+ALLOC_LOOKBACK_PERIODS = 3
+
 # Cities we actively care about for the City Alloc dataset. Statewide totals
 # stay in the news-release rollup table.
 WATCH_CITIES_LIKE = ("AUSTIN",)
@@ -129,6 +145,18 @@ def _latest_period(conn: sqlite3.Connection, table: str) -> tuple[int, int] | No
     return row if row else None
 
 
+def _shift_period(yr: int, mo: int, delta: int) -> tuple[int, int]:
+    """Shift a (year, month) pair by delta months. Handles year rollover."""
+    idx = yr * 12 + (mo - 1) + delta
+    return idx // 12, idx % 12 + 1
+
+
+def _shift_iso_month(iso_date: str, delta: int) -> str:
+    """Shift an ISO date to the first day of a month delta months away."""
+    yr, mo = _shift_period(int(iso_date[:4]), int(iso_date[5:7]), delta)
+    return f"{yr:04d}-{mo:02d}-01"
+
+
 def _latest_mb_date(conn: sqlite3.Connection) -> str | None:
     row = conn.execute(
         "SELECT MAX(obligation_end_date) FROM mixed_beverage"
@@ -174,11 +202,12 @@ def ingest_city_alloc(conn: sqlite3.Connection, client: httpx.Client,
         " OR ".join(f"upper(city) LIKE '{c}%'" for c in WATCH_CITIES_LIKE)
     ]
     if since_period:
-        yr, mo = since_period
-        # Periods strictly newer than the latest we have.
+        # Re-read a few trailing periods rather than only what is strictly
+        # newer, so revised allocations are corrected in place.
         # Socrata column names: report_year / report_month.
+        yr, mo = _shift_period(*since_period, -ALLOC_LOOKBACK_PERIODS)
         where_parts.append(
-            f"(report_year > {yr} OR (report_year = {yr} AND report_month > {mo}))"
+            f"(report_year > {yr} OR (report_year = {yr} AND report_month >= {mo}))"
         )
     where = " AND ".join(f"({p})" for p in where_parts)
 
@@ -222,9 +251,9 @@ def ingest_county_alloc(conn: sqlite3.Connection, client: httpx.Client,
     )
     where_parts = [name_clause]
     if since_period:
-        yr, mo = since_period
+        yr, mo = _shift_period(*since_period, -ALLOC_LOOKBACK_PERIODS)
         where_parts.append(
-            f"(report_year > {yr} OR (report_year = {yr} AND report_month > {mo}))"
+            f"(report_year > {yr} OR (report_year = {yr} AND report_month >= {mo}))"
         )
     where = " AND ".join(f"({p})" for p in where_parts)
 
@@ -269,9 +298,11 @@ def ingest_mixed_beverage(conn: sqlite3.Connection, client: httpx.Client,
     where_parts = [city_clause]
     if since_date:
         # Column is a datetime despite its name. SoQL wants ISO with quotes.
-        since_iso = f"{since_date}T00:00:00.000"
+        # Back the floor off by MB_LOOKBACK_MONTHS and use '>=' so late and
+        # amended filings behind the high-water mark are still picked up.
+        floor = _shift_iso_month(since_date, -MB_LOOKBACK_MONTHS)
         where_parts.append(
-            f"obligation_end_date_yyyymmdd > '{since_iso}'"
+            f"obligation_end_date_yyyymmdd >= '{floor}T00:00:00.000'"
         )
     else:
         cutoff = (date.today().replace(day=1)
@@ -422,6 +453,15 @@ MONTHS = {m: i for i, m in enumerate(
     ["january","february","march","april","may","june",
      "july","august","september","october","november","december"], start=1)}
 
+DOLLAR_RE = re.compile(r"\$([\d.]+)\s*([BM])", re.IGNORECASE)
+MONTH_RE  = re.compile(
+    r"sales tax allocations for (\w+),\s*([\d.]+)\s*percent (more|less)",
+    re.IGNORECASE,
+)
+MONTHS = {m: i for i, m in enumerate(
+    ["january","february","march","april","may","june",
+     "july","august","september","october","november","december"], start=1)}
+
 
 def _to_dollars(text: str) -> float | None:
     m = DOLLAR_RE.search(text)
@@ -486,6 +526,7 @@ def _parse_release(client: httpx.Client, url: str) -> dict | None:
         "ytd_yoy_pct": ytd,
         "source_url": url,
     }
+
 
 
 def ingest_statewide(conn: sqlite3.Connection, client: httpx.Client,
