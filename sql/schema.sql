@@ -80,6 +80,19 @@ CREATE TABLE IF NOT EXISTS venue_watchlist (
 
 CREATE INDEX IF NOT EXISTS idx_mb_city_period ON mixed_beverage(location_city, obligation_end_date);
 CREATE INDEX IF NOT EXISTS idx_mb_name        ON mixed_beverage(location_name);
+
+-- Was created by hand on guildenstern and never made it back into this file,
+-- so fresh installs came up without it.
+CREATE INDEX IF NOT EXISTS idx_mb_city_date_total
+    ON mixed_beverage(location_city, obligation_end_date, total_receipts);
+
+-- Indexes the EXPRESSION upper(location_city), not the bare column. The API
+-- filters with upper(location_city) = 'AUSTIN' to stay case-insensitive, and a
+-- plain column index cannot serve a function call. Without this,
+-- /api/mb/austin/top degrades to a full scan. Keep the expression here
+-- byte-identical to the one in the query.
+CREATE INDEX IF NOT EXISTS idx_mb_upper_city_date
+    ON mixed_beverage(upper(location_city), obligation_end_date, total_receipts);
 CREATE INDEX IF NOT EXISTS idx_stc_period     ON sales_tax_city(period_year, period_month);
 CREATE INDEX IF NOT EXISTS idx_stcounty_period ON sales_tax_county(period_year, period_month);
 

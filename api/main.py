@@ -231,7 +231,21 @@ def mb_austin_top(
     n: int = Query(25, ge=1, le=200),
     months: int = Query(12, ge=1, le=60),
 ) -> dict:
-    """Top Austin venues by total mixed-beverage receipts over the trailing N months."""
+    """Top Austin venues by total mixed-beverage receipts over the trailing N months.
+
+    Two details here are load-bearing for performance; measured on 53k rows:
+
+    1. The cutoff is a scalar subquery, not a cross join. Written as
+       `FROM mixed_beverage, cutoff` SQLite plans the CTE as a co-routine and
+       re-drives it, which turned this query into a 180-second table scan and
+       exhausted the single uvicorn worker whenever a browser retried.
+    2. `upper(location_city)` is matched by idx_mb_upper_city_date, an index on
+       that exact expression. A plain index on the bare column cannot serve a
+       function call, so without the expression index this falls back to a scan.
+
+    180,000 ms -> 23 ms. Check `EXPLAIN QUERY PLAN` before editing: it should
+    read SEARCH ... USING INDEX idx_mb_upper_city_date, never SCAN.
+    """
     # months and n are int-validated by Query() above, safe to inline into SQL.
     with db() as conn:
         data = rows(conn, f"""
@@ -243,9 +257,9 @@ def mb_austin_top(
                    MIN(location_address) AS address,
                    MIN(location_zip)     AS zip,
                    SUM(total_receipts)   AS total
-            FROM mixed_beverage, cutoff
+            FROM mixed_beverage
             WHERE upper(location_city) = 'AUSTIN'
-              AND obligation_end_date >= cutoff.d
+              AND obligation_end_date >= (SELECT d FROM cutoff)
             GROUP BY location_name
             ORDER BY total DESC
             LIMIT {n}
