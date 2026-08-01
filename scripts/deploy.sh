@@ -137,9 +137,14 @@ info "GET /api/health -> $health"
 
 # This endpoint took 180s before the index fix; treat a slow response as a
 # regression, not a hiccup.
-read -r code secs < <(ssh "$REMOTE" \
+# curl -w emits no trailing newline, so `read` returns non-zero at EOF even
+# when it populated the variables. Under `set -e` that killed the script after
+# a successful deploy, with no failure message. Capture then split instead.
+top=$(ssh "$REMOTE" \
   "curl -s -o /dev/null -w '%{http_code} %{time_total}' '$API_URL/api/mb/austin/top?n=25&months=12'" \
-  || echo "000 0")
+  2>/dev/null) || top="000 0"
+code=${top%% *}
+secs=${top##* }
 info "GET /api/mb/austin/top -> $code in ${secs}s"
 if [[ $code == 200 ]] && awk "BEGIN{exit !($secs > 2)}"; then
   warn "that endpoint should answer in well under a second"
