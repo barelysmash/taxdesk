@@ -51,7 +51,7 @@ CapMetro share, and any Travis County ESDs / MUDs that levy their own.
 - Scraper is the only writer. API is read-only.
 - SQLite in WAL mode handles the read concurrency comfortably.
 - **No reverse proxy.** uvicorn binds the Tailscale IP directly and serves the
-  frontend itself. `deploy/Caddyfile.snippet` is vestigial and unused.
+  frontend itself. There is no Caddy, nginx, or other proxy in the path.
 
 ## Layout
 
@@ -84,8 +84,7 @@ taxdesk/
 │   ├── taxdesk-api.service
 │   ├── taxdesk-scrape.service
 │   ├── taxdesk-scrape.timer
-│   ├── taxdesk.env.example
-│   └── Caddyfile.snippet  # unused, kept for reference
+│   └── taxdesk.env.example
 ├── .gitattributes         # forces LF on everything that runs on Linux
 ├── .gitignore
 ├── requirements.txt
