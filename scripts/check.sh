@@ -1,0 +1,196 @@
+#!/usr/bin/env bash
+#
+# taxdesk check  —  runs ON rosencrantz (Git Bash / MINGW64)
+#
+# Asserts the invariants behind every bug that has cost real debugging time on
+# this project. Each check exists because the thing it tests actually broke.
+#
+#   bash /c/bSmash-dev/taxdesk/scripts/check.sh            # static, on the repo
+#   bash /c/bSmash-dev/taxdesk/scripts/check.sh --remote    # also check guildenstern
+#
+# Exit code is 0 only if everything passes, so this works as a pre-commit hook:
+#   ln -s ../../scripts/check.sh /c/bSmash-dev/taxdesk/.git/hooks/pre-commit
+#
+# Run it after applying any patch. Twice now a patch authored against a stale
+# copy of the tree has silently reverted an earlier fix, and both times the
+# tell was visible before deployment.
+#
+set -uo pipefail   # deliberately NOT -e: we want every failure reported, not the first
+
+REPO="${TAXDESK_REPO:-/c/bSmash-dev/taxdesk}"
+REMOTE="${TAXDESK_REMOTE:-barelysmash@100.113.110.44}"
+APP_DIR="${TAXDESK_APP:-/opt/taxdesk}"
+DB="${TAXDESK_DB:-/var/lib/taxdesk/taxdesk.db}"
+RUN_USER="${TAXDESK_USER:-ocelia}"
+API_URL="${TAXDESK_API_URL:-http://100.113.110.44:8770}"
+
+DO_REMOTE=0
+[[ ${1:-} == --remote ]] && DO_REMOTE=1
+[[ ${1:-} == -h || ${1:-} == --help ]] && { sed -n '2,18p' "$0"; exit 0; }
+
+PASS=0; FAIL=0
+say()  { printf '\n\033[1;35m== %s\033[0m\n' "$*"; }
+ok()   { printf '   \033[32m✓\033[0m %s\n' "$*"; PASS=$((PASS+1)); }
+bad()  { printf '   \033[1;31m✗ %s\033[0m\n' "$*"; FAIL=$((FAIL+1)); }
+note() { printf '     \033[33m%s\033[0m\n' "$*"; }
+
+SCRAPE="$REPO/scraper/scrape.py"
+MAIN="$REPO/api/main.py"
+SCHEMA="$REPO/sql/schema.sql"
+
+# ------------------------------------------------------------ 1. watermark
+# d301971. A strict '>' against MAX(obligation_end_date) let early filings lift
+# the floor above the returns that post in arrears; the scraper then ingested
+# nothing while exiting 0. Reverted once by 7c73344, which was authored against
+# a pre-fix copy. Froze the data for ten weeks.
+say "watermark (regression: data silently stops updating)"
+if grep -q "obligation_end_date_yyyymmdd > '" "$SCRAPE"; then
+  bad "strict '>' watermark is back in ingest_mixed_beverage()"
+  note "incremental pulls will report mb: 0 forever; see README Caveats"
+else
+  ok "no strict '>' watermark"
+fi
+grep -q 'MB_LOOKBACK_MONTHS' "$SCRAPE"      && ok "MB_LOOKBACK_MONTHS defined"      || bad "MB_LOOKBACK_MONTHS missing"
+grep -q 'ALLOC_LOOKBACK_PERIODS' "$SCRAPE"  && ok "ALLOC_LOOKBACK_PERIODS defined"  || bad "ALLOC_LOOKBACK_PERIODS missing"
+grep -q "yyyymmdd >= '{floor}" "$SCRAPE"    && ok "lookback floor applied"          || bad "lookback floor not applied"
+
+# refresh.sh derives the window from source; if that extraction breaks it falls
+# back to 6 and the two can disagree without anyone noticing.
+lb=$(sed -n 's/^MB_LOOKBACK_MONTHS *= *\([0-9][0-9]*\).*/\1/p' "$SCRAPE" | head -1)
+if [[ -n $lb ]]; then ok "refresh.sh can read the lookback from source (=$lb)"
+else bad "refresh.sh cannot parse MB_LOOKBACK_MONTHS; it will silently use 6"; fi
+
+# ------------------------------------------------------------ 2. statewide
+# 7c73344. The original parser matched markdown pipe tables against raw HTML —
+# written against a rendered view of the page — so it never matched a byte.
+say "statewide parser (regression: sales_tax_statewide stays empty)"
+grep -q 'TABLE_ROW_RE' "$SCRAPE"   && { bad "markdown pipe-table regex is back"; note "it cannot match raw HTML; verify against the SOURCE, not a rendering"; } || ok "no markdown table regex"
+grep -q '_TableParser' "$SCRAPE"   && ok "_TableParser (html.parser) present"    || bad "_TableParser missing"
+# Match URL construction only. The docstring names the old form deliberately,
+# so a bare grep for '?page=' reports the explanation as the bug.
+if grep -qE '(f"|f.)[^"]*\?page=\{|NEWS_INDEX\}\?page=' "$SCRAPE"; then
+  bad "?page=N pagination is back"
+  note "the news index ignores it; paginate with fromDate/toDate"
+else
+  ok "no ?page=N pagination"
+fi
+grep -q 'fromDate=' "$SCRAPE"      && ok "date-range pagination present"          || bad "date-range pagination missing"
+grep -q 'ytd_yoy_pct' "$SCRAPE"    && ok "ytd_yoy_pct populated"                  || bad "ytd_yoy_pct not written"
+
+# ------------------------------------------------------------ 3. hot query
+# 1baef13. 180s -> 23ms. Both halves matter: the scalar subquery and the
+# expression index. Either one reverting brings the stall back.
+say "hot query (regression: /api/mb/austin/top hangs, stalls the single worker)"
+grep -q '(SELECT d FROM cutoff)' "$MAIN" && ok "cutoff is a scalar subquery" || { bad "cutoff is not a scalar subquery"; note "FROM mixed_beverage, cutoff re-drives the CTE: 23ms -> 180s"; }
+# The docstring mentions the old form on purpose, so only flag it inside SQL.
+if grep -q '^\s*FROM mixed_beverage, cutoff' "$MAIN"; then
+  bad "cross join to cutoff present in the query"
+else
+  ok "no cross join to cutoff"
+fi
+grep -q 'idx_mb_upper_city_date' "$SCHEMA" && ok "expression index declared in schema.sql" || bad "idx_mb_upper_city_date missing from schema.sql"
+grep -q 'idx_mb_city_date_total' "$SCHEMA" && ok "idx_mb_city_date_total declared"          || bad "idx_mb_city_date_total missing from schema.sql"
+
+# ------------------------------------------------------------ 4. watchlist
+# 9b15112. Trailing '%' patterns matched unrelated venues and inflated totals.
+# Reverted once by a schema.sql built from a stale base.
+say "watchlist (regression: peer totals silently inflated)"
+if command -v sqlite3 >/dev/null 2>&1; then
+  tmp=$(mktemp); rm -f "$tmp"
+  if sqlite3 "$tmp" < "$SCHEMA" 2>/dev/null; then
+    ok "schema.sql executes cleanly"
+    n=$(sqlite3 "$tmp" "SELECT COUNT(*) FROM venue_watchlist;")
+    [[ $n -eq 12 ]] && ok "12 venues seeded" || bad "expected 12 venues, found $n"
+    f=$(sqlite3 "$tmp" "SELECT match_pattern FROM venue_watchlist WHERE slug='fonda_san_miguel';")
+    [[ $f == "SAN MIGUEL RESTAURANT" ]] && ok "fonda pattern is the filing name" \
+      || { bad "fonda pattern is '$f'"; note "must be SAN MIGUEL RESTAURANT, not the trading name"; }
+    # MIDNIGHT COWBOY% is the one known-inert wildcard: that venue files nothing.
+    w=$(sqlite3 "$tmp" "SELECT COUNT(*) FROM venue_watchlist WHERE match_pattern LIKE '%\\%' ESCAPE '\\' AND slug <> 'midnight_cowboy';")
+    [[ $w -eq 0 ]] && ok "no trailing-wildcard patterns" || bad "$w wildcard pattern(s) present"
+    sqlite3 "$tmp" < "$SCHEMA" 2>/dev/null && ok "schema.sql is idempotent" || bad "schema.sql not idempotent"
+  else
+    bad "schema.sql failed to execute"
+  fi
+  rm -f "$tmp"
+else
+  note "sqlite3 not on PATH locally — watchlist checks skipped"
+fi
+
+# ------------------------------------------------------------ 5. hygiene
+# refresh.sh is piped into bash on Linux; CRLF makes it die as $'\r'.
+say "file hygiene"
+crlf=0
+for f in "$REPO"/scripts/*.sh "$REPO"/scraper/*.py "$REPO"/api/*.py "$REPO"/sql/*.sql; do
+  [[ -f $f ]] || continue
+  if grep -qU $'\r' "$f" 2>/dev/null; then bad "CRLF in $(basename "$f")"; crlf=1; fi
+done
+((crlf)) && note "fix: sed -i 's/\\r\$//' <file>" || ok "no CRLF in files that run on Linux"
+
+for f in "$SCRAPE" "$MAIN" "$REPO"/scraper/probe.py; do
+  [[ -f $f ]] || continue
+  python -c "import ast,sys; ast.parse(open(sys.argv[1],encoding='utf-8').read())" "$f" 2>/dev/null \
+    && ok "$(basename "$f") parses" || bad "$(basename "$f") has a syntax error"
+done
+
+for f in "$REPO"/scripts/*.sh; do
+  [[ -f $f ]] || continue
+  bash -n "$f" 2>/dev/null && ok "$(basename "$f") parses" || bad "$(basename "$f") has a syntax error"
+done
+
+if [[ -f $REPO/.gitignore ]] && grep -q 'web/.env.local' "$REPO/.gitignore"; then
+  ok "web/.env.local ignored"
+else
+  bad "web/.env.local not in .gitignore"
+fi
+if git -C "$REPO" ls-files --error-unmatch web/.env.local >/dev/null 2>&1; then
+  bad "web/.env.local is TRACKED"
+else
+  ok "web/.env.local not tracked"
+fi
+
+# ------------------------------------------------------------ 6. remote
+if ((DO_REMOTE)); then
+  say "guildenstern"
+  for svc in taxdesk-api taxdesk-scrape.timer; do
+    st=$(ssh "$REMOTE" "systemctl is-active $svc" 2>/dev/null || echo unknown)
+    [[ $st == active ]] && ok "$svc active" || bad "$svc is $st"
+  done
+
+  # Deployed file should match the repo, or the box is running something else.
+  for rel in scraper/scrape.py api/main.py sql/schema.sql; do
+    l=$(sed 's/\r$//' "$REPO/$rel" | sha256sum | cut -d' ' -f1)
+    r=$(ssh "$REMOTE" "sha256sum '$APP_DIR/$rel'" 2>/dev/null | cut -d' ' -f1)
+    [[ -n $r && $l == "$r" ]] && ok "$rel matches deployed copy" || bad "$rel differs from guildenstern"
+  done
+
+  plan=$(ssh "$REMOTE" "sudo -u $RUN_USER sqlite3 '$DB' \"EXPLAIN QUERY PLAN SELECT location_name, SUM(total_receipts) FROM mixed_beverage WHERE upper(location_city)='AUSTIN' AND obligation_end_date >= '2025-07-01' GROUP BY location_name;\"" 2>/dev/null)
+  if grep -q 'idx_mb_upper_city_date' <<<"$plan"; then
+    ok "query planner uses idx_mb_upper_city_date"
+  else
+    bad "expression index NOT used — the 180s stall will return"
+    note "$plan"
+  fi
+
+  top=$(ssh "$REMOTE" "curl -s -o /dev/null -w '%{http_code} %{time_total}' '$API_URL/api/mb/austin/top?n=25&months=12'" 2>/dev/null) || top="000 0"
+  c=${top%% *}; t=${top##* }
+  if [[ $c == 200 ]] && awk "BEGIN{exit !($t < 2)}"; then ok "/api/mb/austin/top -> $c in ${t}s"
+  else bad "/api/mb/austin/top -> $c in ${t}s"; fi
+
+  gap=$(ssh "$REMOTE" "sudo -u $RUN_USER sqlite3 '$DB' \"SELECT (SELECT COUNT(*) FROM mixed_beverage WHERE substr(obligation_end_date,1,7) = (SELECT substr(obligation_end_date,1,7) FROM mixed_beverage GROUP BY 1 HAVING COUNT(*) >= 500 ORDER BY 1 DESC LIMIT 1));\"" 2>/dev/null)
+  [[ -n $gap && $gap -ge 500 ]] && ok "latest complete month has $gap rows" || bad "no fully-reported month found"
+
+  for t in sales_tax_statewide sales_tax_city sales_tax_county venue_watchlist; do
+    n=$(ssh "$REMOTE" "sudo -u $RUN_USER sqlite3 '$DB' 'SELECT COUNT(*) FROM $t;'" 2>/dev/null)
+    [[ -n $n && $n -gt 0 ]] && ok "$t has $n rows" || bad "$t is EMPTY"
+  done
+fi
+
+# ------------------------------------------------------------------ summary
+say "summary"
+printf '   %d passed, %d failed\n' "$PASS" "$FAIL"
+if ((FAIL)); then
+  printf '\n   \033[1;31mDo not deploy.\033[0m Each failure above marks a bug that has already\n'
+  printf '   shipped once on this project.\n\n'
+  exit 1
+fi
+printf '\n   \033[32mAll invariants hold.\033[0m\n\n'
