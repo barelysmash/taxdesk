@@ -27,9 +27,16 @@ PY="$APP_DIR/.venv/bin/python"
 # the handful of early filings that cause the watermark ratchet.
 MIN_FULL_MONTH_ROWS="${MIN_FULL_MONTH_ROWS:-500}"
 
-# Must mirror MB_LOOKBACK_MONTHS in scraper/scrape.py. An incremental pull
-# re-reads back to (max month - this many), so it self-heals any gap shorter
-# than the window. Only a longer gap needs a full backfill.
+# Read straight out of scraper/scrape.py rather than duplicating the number.
+# An incremental pull re-reads back to (max month - this many), so it self-heals
+# any gap shorter than the window; only a longer gap needs a full backfill. If
+# the two ever disagreed, this script would escalate to a three-year backfill
+# nightly or, worse, stay incremental while the data quietly froze.
+_lookback_from_source() {
+    sed -n 's/^MB_LOOKBACK_MONTHS *= *\([0-9][0-9]*\).*/\1/p' \
+        "${TAXDESK_APP:-/opt/taxdesk}/scraper/scrape.py" 2>/dev/null | head -1
+}
+MB_LOOKBACK_MONTHS="${MB_LOOKBACK_MONTHS:-$(_lookback_from_source)}"
 MB_LOOKBACK_MONTHS="${MB_LOOKBACK_MONTHS:-6}"
 
 MODE=auto
