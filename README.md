@@ -51,7 +51,7 @@ CapMetro share, and any Travis County ESDs / MUDs that levy their own.
 - Scraper is the only writer. API is read-only.
 - SQLite in WAL mode handles the read concurrency comfortably.
 - **No reverse proxy.** uvicorn binds the Tailscale IP directly and serves the
-  frontend itself. There is no Caddy, nginx, or other proxy in the path.
+  frontend itself. `deploy/Caddyfile.snippet` is vestigial and unused.
 
 ## Layout
 
@@ -84,7 +84,8 @@ taxdesk/
 │   ├── taxdesk-api.service
 │   ├── taxdesk-scrape.service
 │   ├── taxdesk-scrape.timer
-│   └── taxdesk.env.example
+│   ├── taxdesk.env.example
+│   └── Caddyfile.snippet  # unused, kept for reference
 ├── .gitattributes         # forces LF on everything that runs on Linux
 ├── .gitignore
 ├── requirements.txt
@@ -293,4 +294,20 @@ single outlier doesn't wash out the rest.
 
 ## License
 
-Private to barelysmash. No license granted.
+[PolyForm Noncommercial License 1.0.0](LICENSE.md) — see `LICENSE.md`.
+
+Free for personal, research, educational, charitable, and government use.
+Commercial use requires a separate license from the copyright holder.
+
+Two things this does not do:
+
+- It does not restrict the copyright holder. Running taxdesk for Fonda San
+  Miguel's own purposes is unaffected; the terms bind licensees, not the
+  licensor.
+- It does not cover the data. Sales tax allocations and mixed beverage receipts
+  are Texas public records published by the Comptroller under that agency's
+  terms.
+
+Note that PolyForm Noncommercial is a source-available license, not an
+OSI-approved open source one, and "noncommercial" has no crisp legal
+definition — the license enumerates examples rather than drawing a bright line.
