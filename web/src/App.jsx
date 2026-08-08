@@ -250,10 +250,12 @@ function TransitView() {
 function BeverageView() {
   const [data, setData]   = useState(null);
   const [top,  setTop]    = useState(null);
+  const [beta, setBeta]   = useState(null);
 
   useEffect(() => {
     fetch("/api/mb/watchlist").then(r => r.json()).then(setData);
     fetch("/api/mb/austin/top?n=25&months=12").then(r => r.json()).then(setTop);
+    fetch("/api/mb/beta?months=36").then(r => r.json()).then(setBeta);
   }, []);
 
   if (!data) return <div className="empty">Loading…</div>;
@@ -268,6 +270,7 @@ function BeverageView() {
         <VenueBucket title="Mexican fine dining"  venues={buckets.mexican}  accent={GOLD} />
         <VenueBucket title="Cocktail-forward"     venues={buckets.cocktail} accent={GREEN} />
       </div>
+      <MarketBeta data={beta} />
       <section className="card" style={{ marginTop: 20 }}>
         <h2>Austin · top 25 venues, trailing 12 months</h2>
         <div className="sub">By total mixed-beverage gross receipts</div>
@@ -324,6 +327,91 @@ function VenueBucket({ title, venues, accent }) {
           </div>
         );
       })}
+    </section>
+  );
+}
+
+function MarketBeta({ data }) {
+  if (!data) return null;
+  const { market, venues } = data;
+  const ttm   = market.ttm_total;
+  const prior = market.prior_ttm_total;
+  const drift = prior ? (ttm / prior - 1) * 100 : null;
+
+  // Beta only means something when the venue actually tracks the market. Below
+  // this, month-to-month noise dominates and the slope is not interpretable.
+  const MIN_CORR = 0.4;
+
+  return (
+    <section className="card" style={{ marginTop: 20 }}>
+      <h2>Market resilience · sensitivity to Austin</h2>
+      <div className="sub">
+        Beta is how far a venue moves when the whole Austin market moves.
+        Below 1.00 means it falls less than the market in a downturn.
+      </div>
+
+      <div className="grid cols-2" style={{ marginTop: 12, marginBottom: 16 }}>
+        <div>
+          <div className="sub">Austin market, trailing 12 months</div>
+          <div style={{ fontSize: 22, fontFamily: "Instrument Serif, serif" }}>
+            {fmtUSD(ttm, { compact: true })}
+          </div>
+          {drift != null && (
+            <div className={deltaClass(drift)} style={{ fontSize: 12 }}>
+              {fmtPct(drift)} vs prior twelve months
+            </div>
+          )}
+        </div>
+        <div>
+          <div className="sub">Market monthly volatility</div>
+          <div style={{ fontSize: 22, fontFamily: "Instrument Serif, serif" }}>
+            {(market.volatility * 100).toFixed(1)}%
+          </div>
+          <div className="sub" style={{ fontSize: 12 }}>
+            {market.series.length} months to {market.series.at(-1)?.ym}
+          </div>
+        </div>
+      </div>
+
+      <table className="ledger">
+        <thead>
+          <tr>
+            <th>Venue</th>
+            <th className="r" style={{ textAlign: "right" }}>Beta</th>
+            <th className="r" style={{ textAlign: "right" }}>Correlation</th>
+            <th className="r" style={{ textAlign: "right" }}>Own volatility</th>
+            <th className="r" style={{ textAlign: "right" }}>TTM receipts</th>
+          </tr>
+        </thead>
+        <tbody>
+          {venues.map(v => {
+            const weak = v.corr < MIN_CORR;
+            return (
+              <tr key={v.slug}>
+                <td style={{ fontWeight: v.bucket === "home" ? 600 : 400 }}>
+                  {v.display_name}
+                </td>
+                <td className="r mono" style={{ color: weak ? "var(--ink-soft)" : undefined }}>
+                  {v.beta.toFixed(2)}
+                </td>
+                <td className="r mono" style={{ color: "var(--ink-soft)", fontSize: 12 }}>
+                  {v.corr.toFixed(2)}{weak ? " · weak" : ""}
+                </td>
+                <td className="r mono" style={{ fontSize: 12 }}>
+                  {(v.volatility * 100).toFixed(1)}%
+                </td>
+                <td className="r">{fmtUSD(v.ttm_total, { compact: true })}</td>
+              </tr>
+            );
+          })}
+        </tbody>
+      </table>
+
+      <div className="sub" style={{ marginTop: 10, fontSize: 12 }}>
+        Rows marked weak have a correlation below {MIN_CORR.toFixed(1)}; their beta is
+        noise rather than signal. The most recent month is excluded because
+        filings arrive in arrears.
+      </div>
     </section>
   );
 }

@@ -226,6 +226,121 @@ def mb_venue(slug: str) -> dict:
     return {"venue": dict(venue), "locations": locations, "monthly": monthly}
 
 
+@app.get("/api/mb/beta")
+def mb_beta(months: int = Query(36, ge=12, le=120),
+            min_months: int = Query(24, ge=6, le=120)):
+    """Each watchlist venue's sensitivity to the Austin mixed-beverage market.
+
+    Beta is the slope of the venue's monthly percentage change regressed on the
+    market's. Below 1.0 means the venue falls less than the market in a
+    downturn, which is what a resilient regular base looks like in the data.
+
+    Computed in Python rather than SQL: SQLite has no regression function, and
+    the series is at most a few hundred points per venue.
+    """
+    with db() as conn:
+        mkt_rows = rows(conn, f"""
+            WITH cutoff AS (
+                SELECT date(MAX(obligation_end_date), '-{months} months') AS d
+                FROM mixed_beverage
+            )
+            SELECT substr(obligation_end_date, 1, 7) AS ym,
+                   SUM(total_receipts) AS total
+            FROM mixed_beverage
+            WHERE upper(location_city) = 'AUSTIN'
+              AND obligation_end_date >= (SELECT d FROM cutoff)
+            GROUP BY ym
+            ORDER BY ym
+        """)
+        venue_rows = rows(conn, f"""
+            WITH cutoff AS (
+                SELECT date(MAX(obligation_end_date), '-{months} months') AS d
+                FROM mixed_beverage
+            )
+            SELECT w.slug, w.display_name, w.bucket,
+                   substr(m.obligation_end_date, 1, 7) AS ym,
+                   SUM(m.total_receipts) AS total
+            FROM venue_watchlist w
+            JOIN mixed_beverage m ON m.location_name LIKE w.match_pattern
+            WHERE upper(m.location_city) = 'AUSTIN'
+              AND m.obligation_end_date >= (SELECT d FROM cutoff)
+            GROUP BY w.slug, ym
+            ORDER BY w.slug, ym
+        """)
+
+    market = {r["ym"]: float(r["total"] or 0) for r in mkt_rows}
+    ordered = sorted(market)
+    # The most recent month is nearly always partial: venues file in arrears,
+    # so including it would read as a market collapse every single month.
+    if len(ordered) > 1:
+        ordered = ordered[:-1]
+
+    def pct_changes(series, keys):
+        out = {}
+        for a, b in zip(keys, keys[1:]):
+            pa = series.get(a)
+            if pa:
+                out[b] = series.get(b, 0) / pa - 1
+        return out
+
+    mkt_ch = pct_changes(market, ordered)
+
+    by_venue = {}
+    for r in venue_rows:
+        v = by_venue.setdefault(r["slug"], {"name": r["display_name"],
+                                            "bucket": r["bucket"], "series": {}})
+        v["series"][r["ym"]] = float(r["total"] or 0)
+
+    def stats(ch):
+        common = [k for k in ordered[1:] if k in ch and k in mkt_ch]
+        n = len(common)
+        if n < min_months - 1:
+            return None
+        xs = [mkt_ch[k] for k in common]
+        ys = [ch[k] for k in common]
+        mx = sum(xs) / n
+        my = sum(ys) / n
+        sxx = sum((x - mx) ** 2 for x in xs)
+        sxy = sum((x - mx) * (y - my) for x, y in zip(xs, ys))
+        syy = sum((y - my) ** 2 for y in ys)
+        if sxx == 0 or syy == 0:
+            return None
+        beta = sxy / sxx
+        corr = sxy / ((sxx * syy) ** 0.5)
+        vol = (syy / (n - 1)) ** 0.5 if n > 1 else 0.0
+        return {"beta": round(beta, 3), "corr": round(corr, 3),
+                "volatility": round(vol, 4), "n_months": n}
+
+    mkt_vals = [mkt_ch[k] for k in ordered[1:] if k in mkt_ch]
+    mn = len(mkt_vals)
+    mkt_mean = sum(mkt_vals) / mn if mn else 0.0
+    mkt_vol = ((sum((x - mkt_mean) ** 2 for x in mkt_vals) / (mn - 1)) ** 0.5) if mn > 1 else 0.0
+
+    out = []
+    for slug, v in by_venue.items():
+        st = stats(pct_changes(v["series"], ordered))
+        if not st:
+            continue
+        window = [v["series"].get(k, 0) for k in ordered[-12:]]
+        out.append({"slug": slug, "display_name": v["name"], "bucket": v["bucket"],
+                    "ttm_total": round(sum(window), 2), **st})
+    out.sort(key=lambda r: r["beta"])
+
+    return {
+        "window_months": months,
+        "market": {
+            "series": [{"ym": k, "total": round(market[k], 2)} for k in ordered],
+            "volatility": round(mkt_vol, 4),
+            "ttm_total": round(sum(market[k] for k in ordered[-12:]), 2),
+            "prior_ttm_total": round(sum(market[k] for k in ordered[-24:-12]), 2)
+                                if len(ordered) >= 24 else None,
+        },
+        "venues": out,
+        "note": "Beta below 1.0 means the venue moves less than the market. "
+                "The latest month is excluded because filings arrive in arrears.",
+    }
+
+
 @app.get("/api/mb/austin/top")
 def mb_austin_top(
     n: int = Query(25, ge=1, le=200),
