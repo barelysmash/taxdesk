@@ -10,6 +10,7 @@ const SECTIONS = [
   { id: "sales",     label: "Sales Tax" },
   { id: "transit",   label: "CapMetro & ESDs" },
   { id: "beverage",  label: "Mixed Beverage" },
+  { id: "ops",      label: "Operations" },
 ];
 
 const AXIS = { fontSize: 11, fontFamily: "IBM Plex Mono" };
@@ -51,6 +52,7 @@ export default function App() {
         {section === "sales"    && <SalesTaxView />}
         {section === "transit"  && <TransitView />}
         {section === "beverage" && <BeverageView />}
+        {section === "ops"      && <OpsView />}
       </main>
       <footer className="colophon">
         <span>Source · Texas Comptroller of Public Accounts</span>
@@ -413,6 +415,140 @@ function MarketBeta({ data }) {
         filings arrive in arrears.
       </div>
     </section>
+  );
+}
+
+
+// ---------------------------------------------------------------------------
+// Operations — internal product mix. Unlike every other view, this data is not
+// scraped: it is loaded from Toast exports by scripts/load_mix.py.
+// ---------------------------------------------------------------------------
+
+function OpsView() {
+  const [periods, setPeriods] = useState(null);
+  const [groups,  setGroups]  = useState(null);
+  const [sel,     setSel]     = useState(null);
+
+  useEffect(() => {
+    fetch("/api/mix/periods").then(r => r.json()).then(d => {
+      setPeriods(d);
+      if (d.periods?.length) setSel(d.periods[0].period_start);
+    });
+  }, []);
+
+  useEffect(() => {
+    const q = sel ? `?period_start=${encodeURIComponent(sel)}` : "";
+    fetch(`/api/mix/groups${q}`).then(r => r.json()).then(setGroups);
+  }, [sel]);
+
+  if (!periods) return <div className="sub">Loading…</div>;
+
+  if (!periods.periods?.length) {
+    return (
+      <section className="card">
+        <h2>No product mix loaded</h2>
+        <div className="sub">
+          Export a product mix from Toast and load it with:
+          <pre style={{ marginTop: 8, fontSize: 12 }}>
+{`python scripts/load_mix.py ProductMix_START_END.xlsx --service-days N`}
+          </pre>
+          Fonda is closed Sunday, so a full year is 312 service days, not 365.
+        </div>
+      </section>
+    );
+  }
+
+  const cur = periods.periods.find(p => p.period_start === sel) || periods.periods[0];
+
+  return (
+    <>
+      <section className="card">
+        <h2>Operations · product mix</h2>
+        <div className="sub">
+          Internal POS data, loaded manually. Not scraped, and not comparable to
+          the market figures elsewhere in taxdesk.
+        </div>
+
+        <div style={{ display: "flex", gap: 8, flexWrap: "wrap", margin: "12px 0" }}>
+          {periods.periods.map(p => (
+            <button key={p.period_start}
+                    onClick={() => setSel(p.period_start)}
+                    aria-pressed={p.period_start === sel}
+                    style={{
+                      fontSize: 12,
+                      fontWeight: p.period_start === sel ? 600 : 400,
+                      opacity:    p.period_start === sel ? 1 : 0.6,
+                    }}>
+              {p.period_start} → {p.period_end}
+            </button>
+          ))}
+        </div>
+
+        <div className="grid cols-2" style={{ marginTop: 12 }}>
+          <div className="kpi">
+            <span className="v">{fmtUSD(cur.gross, { compact: true })}</span>
+            <span className="mono" style={{ fontSize: 11, color: "#4a423a" }}>operating gross · ex gift cards</span>
+          </div>
+          <div className="kpi">
+            <span className="v">{fmtUSD(cur.spend_per_cover)}</span>
+            <span className="mono" style={{ fontSize: 11, color: "#4a423a" }}>spend per cover</span>
+          </div>
+          <div className="kpi">
+            <span className="v">{cur.covers?.toLocaleString()}</span>
+            <span className="mono" style={{ fontSize: 11, color: "#4a423a" }}>covers · entree-equivalents</span>
+          </div>
+          <div className="kpi">
+            <span className="v">{fmtUSD(cur.gross_per_service_day, { compact: true })}</span>
+            <span className="mono" style={{ fontSize: 11, color: "#4a423a" }}>gross per service day</span>
+          </div>
+        </div>
+        <div className="sub" style={{ marginTop: 10, fontSize: 12 }}>
+          {cur.service_days} service days of {cur.days} calendar days ·{" "}
+          {cur.covers_per_service_day} covers per service day · covers are
+          entree-equivalents, not a check count
+        </div>
+      </section>
+
+      {groups?.groups?.length > 0 && (
+        <section className="card" style={{ marginTop: 20 }}>
+          <h2>Menu groups</h2>
+          <div className="sub">
+            {groups.compared_to
+              ? `Per-cover change against ${groups.compared_to.period_start} → ${groups.compared_to.period_end}. `
+              : "Load a second period to enable comparison. "}
+            Per-cover is the comparable figure: it strips out both period length
+            and how busy the restaurant was.
+          </div>
+          <table className="ledger" style={{ marginTop: 12 }}>
+            <thead>
+              <tr>
+                <th>Menu group</th>
+                <th style={{ textAlign: "right" }}>Gross per day</th>
+                <th style={{ textAlign: "right" }}>Units per day</th>
+                <th style={{ textAlign: "right" }}>Units per cover</th>
+                <th style={{ textAlign: "right" }}>Per-cover change</th>
+              </tr>
+            </thead>
+            <tbody>
+              {groups.groups.map(g => {
+                const ch = g.units_per_cover_change;
+                return (
+                  <tr key={g.menu_group}>
+                    <td>{g.menu_group}</td>
+                    <td className="r">{fmtUSD(g.gross_per_day)}</td>
+                    <td className="r mono">{g.units_per_day.toFixed(1)}</td>
+                    <td className="r mono">{g.units_per_cover.toFixed(2)}</td>
+                    <td className={`r ${ch != null ? deltaClass(ch * 100) : ""}`}>
+                      {ch != null ? fmtPct(ch * 100) : "—"}
+                    </td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </section>
+      )}
+    </>
   );
 }
 

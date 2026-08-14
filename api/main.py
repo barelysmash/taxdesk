@@ -226,6 +226,107 @@ def mb_venue(slug: str) -> dict:
     return {"venue": dict(venue), "locations": locations, "monthly": monthly}
 
 
+@app.get("/api/mix/periods")
+def mix_periods():
+    """Product mix periods loaded so far, newest first."""
+    with db() as conn:
+        try:
+            data = rows(conn, """
+                SELECT period_start, period_end, days, service_days,
+                       covers, gross, source_file, loaded_at
+                FROM mix_period
+                ORDER BY period_start DESC
+            """)
+        except sqlite3.OperationalError:
+            return {"periods": [], "note": "no product mix loaded yet"}
+    for r in data:
+        cov, gr, sd = r.get("covers"), r.get("gross"), r.get("service_days")
+        r["spend_per_cover"] = round(gr / cov, 2) if cov else None
+        r["gross_per_service_day"] = round(gr / sd, 2) if sd else None
+        r["covers_per_service_day"] = round(cov / sd, 1) if sd else None
+    return {"periods": data}
+
+
+@app.get("/api/mix/groups")
+def mix_groups(period_start: str | None = None,
+               compare_to: str | None = None,
+               limit: int = Query(25, ge=1, le=100)):
+    """Menu group performance for a period, optionally against another.
+
+    Everything is normalised per service day and per cover, because raw totals
+    from a 26-day export and a 365-day export cannot be compared directly.
+    """
+    with db() as conn:
+        try:
+            periods = rows(conn, """
+                SELECT period_start, period_end, service_days, covers, gross
+                FROM mix_period ORDER BY period_start DESC
+            """)
+        except sqlite3.OperationalError:
+            return {"groups": [], "note": "no product mix loaded yet"}
+        if not periods:
+            return {"groups": [], "note": "no product mix loaded yet"}
+
+        cur = next((p for p in periods if p["period_start"] == period_start), periods[0])
+        base = None
+        if compare_to:
+            base = next((p for p in periods if p["period_start"] == compare_to), None)
+        elif len(periods) > 1:
+            base = periods[1]
+
+        def fetch(p):
+            return {r["menu_group"]: r for r in rows(conn, """
+                SELECT menu_group,
+                       SUM(qty_sold)     AS qty,
+                       SUM(gross_amt)    AS gross,
+                       SUM(discount_amt) AS discount
+                FROM product_mix
+                WHERE level = 'group' AND period_start = ? AND period_end = ?
+                GROUP BY menu_group
+            """, (p["period_start"], p["period_end"]))}
+
+        cur_rows = fetch(cur)
+        base_rows = fetch(base) if base else {}
+
+    def norm(r, p):
+        sd = p["service_days"] or 1
+        cv = p["covers"] or 1
+        return {
+            "gross": round(r["gross"] or 0, 2),
+            "qty": round(r["qty"] or 0, 1),
+            "gross_per_day": round((r["gross"] or 0) / sd, 2),
+            "units_per_day": round((r["qty"] or 0) / sd, 2),
+            "units_per_cover": round((r["qty"] or 0) / cv, 4),
+            "discount": round(r["discount"] or 0, 2),
+        }
+
+    out = []
+    for g, r in cur_rows.items():
+        rec = {"menu_group": g, **norm(r, cur)}
+        if g in base_rows:
+            b = norm(base_rows[g], base)
+            rec["base_units_per_cover"] = b["units_per_cover"]
+            rec["base_gross_per_day"] = b["gross_per_day"]
+            # Per-cover change is the honest comparison: it strips out both
+            # period length and how busy the restaurant was.
+            rec["units_per_cover_change"] = (
+                round(rec["units_per_cover"] / b["units_per_cover"] - 1, 4)
+                if b["units_per_cover"] else None)
+            rec["gross_per_day_change"] = (
+                round(rec["gross_per_day"] / b["gross_per_day"] - 1, 4)
+                if b["gross_per_day"] else None)
+        out.append(rec)
+    out.sort(key=lambda r: r["gross"], reverse=True)
+
+    return {
+        "period": cur,
+        "compared_to": base,
+        "groups": out[:limit],
+        "note": "Per-cover figures are the comparable ones. Raw totals scale with "
+                "period length and are shown for reference only.",
+    }
+
+
 @app.get("/api/mb/beta")
 def mb_beta(months: int = Query(36, ge=12, le=120),
             min_months: int = Query(24, ge=6, le=120)):
