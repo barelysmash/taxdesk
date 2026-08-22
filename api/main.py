@@ -511,7 +511,7 @@ def mb_geo(
                    SUM(CASE WHEN obligation_end_date <  (SELECT cur_start FROM bounds)
                             THEN total_receipts ELSE 0 END)   AS prev_total,
                    COUNT(DISTINCT CASE WHEN obligation_end_date >= (SELECT cur_start FROM bounds)
-                                       THEN location_number END) AS venues
+                                       THEN taxpayer_number || '-' || location_number END) AS venues
             FROM mixed_beverage
             WHERE upper(location_city) = 'AUSTIN'
               AND obligation_end_date >= (SELECT prev_start FROM bounds)
