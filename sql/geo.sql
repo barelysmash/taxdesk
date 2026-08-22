@@ -8,4 +8,3 @@
 CREATE INDEX IF NOT EXISTS idx_mb_upper_city_date_zip
     ON mixed_beverage (upper(location_city), obligation_end_date, location_zip);
 
-ANALYZE mixed_beverage;
