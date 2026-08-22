@@ -3,7 +3,7 @@ import { fmtPct } from "./format.js";
 
 // Diverging ramp: oxblood (negative) → cream (zero) → green (positive).
 // Saturates beyond ±cap so a single outlier doesn't wash out the rest.
-function ramp(v, cap = 10) {
+export function ramp(v, cap = 10) {
   if (v == null || isNaN(v)) return "var(--rule-soft)";
   const t = Math.max(-1, Math.min(1, v / cap));
   // cream baseline #f4f1ea (244,241,234)

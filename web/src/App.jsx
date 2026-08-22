@@ -5,6 +5,7 @@ import {
 } from "recharts";
 import { fmtUSD, fmtPct, fmtPeriod, deltaClass } from "./format.js";
 import YoYHeatmap from "./YoYHeatmap.jsx";
+import GeoPanel from "./GeoPanel.jsx";
 
 const SECTIONS = [
   { id: "sales",     label: "Sales Tax" },
@@ -134,6 +135,12 @@ function SalesTaxView() {
             </Bar>
           </BarChart>
         </ResponsiveContainer>
+      </section>
+
+      <section className="card" style={{ gridColumn: "1 / -1" }}>
+        <h2>Mixed beverage by ZIP</h2>
+        <div className="sub">Austin · trailing window vs. the window before it</div>
+        <GeoPanel />
       </section>
 
       <section className="card" style={{ gridColumn: "1 / -1" }}>
