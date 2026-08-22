@@ -483,6 +483,50 @@ def mb_austin_top(
     return {"top": data, "trailing_months": months}
 
 
+
+
+@app.get("/api/mb/geo")
+def mb_geo(
+    months: int = Query(12, ge=1, le=60),
+) -> dict:
+    """Mixed-beverage receipts by ZIP: level, growth, per-venue yield, liquor share.
+
+    Cutoffs are scalar subqueries, never `FROM mixed_beverage, cutoff` --
+    see mb_austin_top for why that shape cost 180 seconds.
+    """
+    with db() as conn:
+        data = rows(conn, f"""
+            WITH anchor AS (
+                SELECT MAX(obligation_end_date) AS d FROM mixed_beverage
+            ),
+            bounds AS (
+                SELECT date((SELECT d FROM anchor), '-{months} months')     AS cur_start,
+                       date((SELECT d FROM anchor), '-{months * 2} months') AS prev_start
+            )
+            SELECT location_zip AS zip,
+                   SUM(CASE WHEN obligation_end_date >= (SELECT cur_start FROM bounds)
+                            THEN total_receipts ELSE 0 END)   AS total,
+                   SUM(CASE WHEN obligation_end_date >= (SELECT cur_start FROM bounds)
+                            THEN liquor_receipts ELSE 0 END)  AS liquor,
+                   SUM(CASE WHEN obligation_end_date <  (SELECT cur_start FROM bounds)
+                            THEN total_receipts ELSE 0 END)   AS prev_total,
+                   COUNT(DISTINCT CASE WHEN obligation_end_date >= (SELECT cur_start FROM bounds)
+                                       THEN location_number END) AS venues
+            FROM mixed_beverage
+            WHERE upper(location_city) = 'AUSTIN'
+              AND obligation_end_date >= (SELECT prev_start FROM bounds)
+            GROUP BY location_zip
+            HAVING total > 0
+            ORDER BY total DESC
+        """)
+
+    for r in data:
+        r["growth"] = round((r["total"] - r["prev_total"]) / r["prev_total"] * 100, 1) \
+            if r["prev_total"] else None
+        r["per_venue"] = round(r["total"] / r["venues"]) if r["venues"] else None
+        r["liquor_sh"] = round(r["liquor"] / r["total"] * 100, 1) if r["total"] else None
+
+    return {"zips": data, "trailing_months": months}
 # ---------------------------------------------------------------------------
 # Static frontend
 #
