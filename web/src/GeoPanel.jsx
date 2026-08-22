@@ -56,6 +56,7 @@ export default function GeoPanel() {
 
   const shade = (z) => {
     if (!z || z[metric] == null) return "var(--rule-soft)";
+    if (metric === "growth" && z.venues < 8) return "var(--rule-soft)";
     if (metric === "growth") return ramp(z[metric], 10);
     const spread = median * 0.5 || 1;
     return ramp((z[metric] - median) / spread * 10, 10);

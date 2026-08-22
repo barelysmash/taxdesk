@@ -14,7 +14,7 @@ git commit -m "add GeoPanel: ZIP grid for MB receipts, growth, per-venue yield, 
 git push
 
 echo "== 4. deploy"
-./scripts/deploy.sh web/dist
+./scripts/deploy.sh --all
 
 echo "== 5. verify"
 curl -sS -o /dev/null -w '   /api/mb/geo -> %{http_code} in %{time_total}s\n' \
