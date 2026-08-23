@@ -137,11 +137,6 @@ function SalesTaxView() {
         </ResponsiveContainer>
       </section>
 
-      <section className="card" style={{ gridColumn: "1 / -1" }}>
-        <h2>Mixed beverage by ZIP</h2>
-        <div className="sub">Austin · trailing window vs. the window before it</div>
-        <GeoPanel />
-      </section>
 
       <section className="card" style={{ gridColumn: "1 / -1" }}>
         <h2>Year-over-year heatmap</h2>
@@ -274,6 +269,12 @@ function BeverageView() {
 
   return (
     <>
+      <section className="card" style={{ gridColumn: "1 / -1" }}>
+        <h2>Mixed beverage by ZIP</h2>
+        <div className="sub">Austin · trailing window vs. the window before it</div>
+        <GeoPanel />
+      </section>
+
       <div className="grid cols-2">
         <VenueBucket title="Fonda San Miguel"     venues={buckets.home}     accent={OX} />
         <VenueBucket title="Mexican fine dining"  venues={buckets.mexican}  accent={GOLD} />
