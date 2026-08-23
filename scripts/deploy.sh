@@ -75,7 +75,7 @@ info "HEAD   $(git -C "$REPO" log -1 --format='%h %s' | cut -c1-64)"
 NEED_API_RESTART=0
 NEED_SCHEMA_APPLY=0
 for rel in "${FILES[@]}"; do
-  [[ -f $REPO/$rel ]] || die "missing: $REPO/$rel"
+  [[ -e $REPO/$rel ]] || die "missing: $REPO/$rel"
   case "$rel" in
     *.py)
       python -c "import ast,sys; ast.parse(open(sys.argv[1],encoding='utf-8').read())" \
@@ -102,8 +102,14 @@ fi
 say "push"
 for rel in "${FILES[@]}"; do
   base=$(basename "$rel")
-  scp -q "$REPO/$rel" "$REMOTE:/tmp/$base"
-  ssh "$REMOTE" "sudo install -m 644 -o $RUN_USER -g $RUN_USER '/tmp/$base' '$APP_DIR/$rel' && rm -f '/tmp/$base'"
+  scp -qr "$REPO/$rel" "$REMOTE:/tmp/$base"
+  if [[ -d $REPO/$rel ]]; then
+    # Directory (e.g. web/dist): replace wholesale so stale hashed assets
+    # from previous builds don't accumulate in the served tree.
+    ssh "$REMOTE" "sudo rm -rf '$APP_DIR/$rel' && sudo mkdir -p '$APP_DIR/$rel' && sudo cp -r '/tmp/$base/.' '$APP_DIR/$rel/' && sudo chown -R $RUN_USER:$RUN_USER '$APP_DIR/$rel' && sudo find '$APP_DIR/$rel' -type f -exec chmod 644 {} + && sudo find '$APP_DIR/$rel' -type d -exec chmod 755 {} + && rm -rf '/tmp/$base'"
+  else
+    ssh "$REMOTE" "sudo install -m 644 -o $RUN_USER -g $RUN_USER '/tmp/$base' '$APP_DIR/$rel' && rm -f '/tmp/$base'"
+  fi
   info "$rel -> $APP_DIR/$rel"
 done
 
