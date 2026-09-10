@@ -67,6 +67,21 @@ BACKFILL_YEARS = 3
 MB_LOOKBACK_MONTHS = 6
 ALLOC_LOOKBACK_PERIODS = 3
 
+# The lookback floor is measured back from the newest month that is actually
+# reported, not from MAX(obligation_end_date).
+#
+# MAX is set by whoever filed furthest ahead, and an early filing carries no
+# obligation to carry data: as of 2026-07 the two newest rows in the table are
+# zero-receipt returns from two venues, which on their own pushed the anchor a
+# month forward and spent a month of the lookback window on nothing. Enough of
+# those and the window is consumed entirely, which is the same silent freeze
+# the window was added to prevent.
+#
+# A month counts as reported when it holds at least this share of the median
+# month's filings. Deriving it from the data rather than fixing a row count
+# keeps it correct as the number of venues changes and as MB_CITIES grows.
+MB_MONTH_COVERAGE = 0.5
+
 # Cities we actively care about for the City Alloc dataset. Statewide totals
 # stay in the news-release rollup table.
 WATCH_CITIES_LIKE = ("AUSTIN",)
@@ -158,10 +173,36 @@ def _shift_iso_month(iso_date: str, delta: int) -> str:
 
 
 def _latest_mb_date(conn: sqlite3.Connection) -> str | None:
-    row = conn.execute(
-        "SELECT MAX(obligation_end_date) FROM mixed_beverage"
-    ).fetchone()
-    return row[0] if row and row[0] else None
+    """Newest obligation date belonging to a month that is actually reported.
+
+    Falls back to the plain maximum when no month clears the coverage bar,
+    which is the case during a first backfill and on any table too small to
+    have a median worth trusting.
+    """
+    months = conn.execute(
+        """
+        SELECT substr(obligation_end_date, 1, 7) AS month,
+               COUNT(*)                          AS filings,
+               MAX(obligation_end_date)          AS newest
+        FROM mixed_beverage
+        WHERE obligation_end_date IS NOT NULL AND obligation_end_date <> ''
+        GROUP BY month
+        ORDER BY month
+        """
+    ).fetchall()
+
+    if not months:
+        return None
+
+    counts = sorted(row[1] for row in months)
+    norm = counts[len(counts) // 2]
+
+    reported = [row for row in months if row[1] >= norm * MB_MONTH_COVERAGE]
+
+    if not reported:
+        return months[-1][2]
+
+    return reported[-1][2]
 
 
 # ---------------------------------------------------------------------------

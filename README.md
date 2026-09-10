@@ -256,6 +256,20 @@ single outlier doesn't wash out the rest.
   cannot duplicate rows and amended filings correct themselves. **Do not
   "optimize" this back into a strict `>`.**
 
+  The window is measured back from the newest month that is actually
+  reported, not from `MAX(obligation_end_date)`. An early filing carries no
+  obligation to carry data — as of 2026-07 the two newest rows were
+  zero-receipt returns from two venues, and on their own they pushed the
+  anchor a month forward and spent a month of the window on nothing. A month
+  counts as reported once it holds at least `MB_MONTH_COVERAGE` (0.5) of the
+  median month's filings, derived from the table rather than fixed at a row
+  count so it stays correct as venues come and go and as `MB_CITIES` grows.
+
+- **Tests.** `python -m pytest tests` covers the watermark, which is the one
+  function whose failure is silent: the strict-`>` version froze
+  mixed-beverage data for ten weeks while exiting 0 every night. Anything
+  that changes how the floor is chosen should be provable here first.
+
 - **`/api/mb/austin/top` is index-sensitive.** It filters on
   `upper(location_city)`, which is served by `idx_mb_upper_city_date`, an index
   on that exact expression — a plain index on the bare column cannot satisfy a
