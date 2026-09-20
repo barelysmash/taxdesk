@@ -23,6 +23,7 @@ RUN_USER="${TAXDESK_USER:-ocelia}"
 API_URL="${TAXDESK_API_URL:-http://100.113.110.44:8770}"
 
 DRY=0
+DO_WEB=0
 FILES=()
 
 DEPLOYABLE=(
@@ -32,7 +33,16 @@ DEPLOYABLE=(
   api/main.py
   api/__init__.py
   sql/schema.sql
+  sql/product_mix.sql
+  scripts/load_mix.py
 )
+
+# Frontend sources are never deployed. The bundle is built HERE and web/dist is
+# shipped, which is what geo_ship.sh established: guildenstern then needs no
+# node_modules, and a broken build fails on this machine where you can see it
+# rather than halfway through an ssh session.
+WEB_SRC="web/src"
+WEB_DIST="web/dist"
 
 say()  { printf '\n\033[1;35m== %s\033[0m\n' "$*"; }
 info() { printf '   %s\n' "$*"; }
@@ -41,7 +51,8 @@ die()  { printf '\033[1;31m   x %s\033[0m\n' "$*" >&2; exit 1; }
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --all)     FILES=("${DEPLOYABLE[@]}") ;;
+    --all)     FILES=("${DEPLOYABLE[@]}"); DO_WEB=1 ;;
+    web|--web) DO_WEB=1 ;;
     --dry-run) DRY=1 ;;
     -h|--help) sed -n '2,18p' "$0"; exit 0 ;;
     -*)        die "unknown flag: $1" ;;
@@ -50,7 +61,7 @@ while [[ $# -gt 0 ]]; do
   shift
 done
 
-((${#FILES[@]})) || die "nothing to deploy; pass file paths or --all"
+((${#FILES[@]} + DO_WEB)) || die "nothing to deploy; pass file paths, web, or --all"
 
 # ---------------------------------------------------------------- 0. preflight
 say "preflight"
@@ -86,16 +97,42 @@ for rel in "${FILES[@]}"; do
     die "$rel has CRLF line endings; run: sed -i 's/\\r\$//' '$REPO/$rel'"
   fi
   [[ $rel == api/* ]] && NEED_API_RESTART=1
-  [[ $rel == sql/schema.sql ]] && NEED_SCHEMA_APPLY=1
+  [[ $rel == sql/*.sql ]] && NEED_SCHEMA_APPLY=1
   info "ok     $rel"
 done
 
 if ((DRY)); then
   say "dry run — nothing sent"
-  info "would deploy: ${FILES[*]}"
+  if ((DO_WEB)); then
+    info "would build $WEB_SRC and deploy $WEB_DIST"
+    info "would verify the served bundle matches the one just built"
+  fi
+  ((${#FILES[@]})) && info "would deploy: ${FILES[*]}"
   ((NEED_API_RESTART)) && info "would restart taxdesk-api"
   ((NEED_SCHEMA_APPLY)) && info "would apply schema DDL"
   exit 0
+fi
+
+# ------------------------------------------------------------------- 0b. build
+# Build before anything is sent. A failed build must not leave a half-deployed
+# box, and the failure has to be loud: on 2026-09-20 a remote build failed on a
+# missing import, the deploy reported success anyway, and the old bundle went
+# on being served for the rest of the session.
+if ((DO_WEB)); then
+  say "build web"
+  [[ -d $REPO/$WEB_SRC ]] || die "no $WEB_SRC in $REPO"
+  OLD_BUNDLE=$(ls "$REPO/$WEB_DIST/assets"/index-*.js 2>/dev/null | head -1 || true)
+  if ! ( cd "$REPO/web" && npm run build ); then
+    die "web build failed — nothing was deployed"
+  fi
+  NEW_BUNDLE=$(ls "$REPO/$WEB_DIST/assets"/index-*.js 2>/dev/null | head -1 || true)
+  [[ -n $NEW_BUNDLE ]] || die "build produced no bundle in $WEB_DIST/assets"
+  info "bundle $(basename "$NEW_BUNDLE")"
+  if [[ -n $OLD_BUNDLE && $OLD_BUNDLE == "$NEW_BUNDLE" ]]; then
+    warn "bundle hash unchanged — either nothing changed in web/src, or the"
+    warn "build reused a cache. Check before assuming the deploy did anything."
+  fi
+  FILES+=("$WEB_DIST")
 fi
 
 # -------------------------------------------------------------------- 1. push
@@ -118,8 +155,11 @@ done
 # IF NOT EXISTS, so this is only to avoid waiting for the 06:00 timer.
 if ((NEED_SCHEMA_APPLY)); then
   say "apply schema"
-  ssh "$REMOTE" "sudo -u $RUN_USER sqlite3 '$DB' < '$APP_DIR/sql/schema.sql'"
-  info "applied (idempotent)"
+  for f in "${FILES[@]}"; do
+    [[ $f == sql/*.sql ]] || continue
+    ssh "$REMOTE" "sudo -u $RUN_USER sqlite3 '$DB' < '$APP_DIR/$f'"
+    info "applied $f (idempotent)"
+  done
 fi
 
 # ----------------------------------------------------------------- 3. restart
@@ -155,6 +195,27 @@ info "GET /api/mb/austin/top -> $code in ${secs}s"
 if [[ $code == 200 ]] && awk "BEGIN{exit !($secs > 2)}"; then
   warn "that endpoint should answer in well under a second"
   warn "check EXPLAIN QUERY PLAN for idx_mb_upper_city_date; a SCAN means the index is missing"
+fi
+
+if ((DO_WEB)); then
+  say "verify web"
+  served=$(ssh "$REMOTE" "curl -s '$API_URL/' | grep -o 'index-[A-Za-z0-9_-]*\.js' | head -1" || true)
+  info "served bundle: ${served:-unknown}"
+  if [[ -n $served && -n ${NEW_BUNDLE:-} ]]; then
+    if [[ $(basename "$NEW_BUNDLE") == "$served" ]]; then
+      ok_web=1
+      info "matches the bundle just built"
+    else
+      warn "served bundle is not the one just built"
+      warn "  built:  $(basename "$NEW_BUNDLE")"
+      warn "  served: $served"
+      warn "the API serves web/dist from disk; a mismatch means the copy did not land"
+    fi
+  fi
+  # /api/mb/geo was the reason web deploys existed; a 500 here means the geo
+  # index is missing from the database, not that the bundle is wrong.
+  geo=$(ssh "$REMOTE" "curl -s -o /dev/null -w '%{http_code} %{time_total}' '$API_URL/api/mb/geo?months=12'" 2>/dev/null) || geo="000 0"
+  info "GET /api/mb/geo -> ${geo% *} in ${geo#* }s"
 fi
 
 say "done"
