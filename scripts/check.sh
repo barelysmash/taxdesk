@@ -189,6 +189,46 @@ fi
 
 fi
 
+# --------------------------------------------------- 4b. schema file ownership
+# sql/geo.sql existed for a month applied by nothing but a one-shot script that
+# had already been run. The index was live on guildenstern and absent from the
+# repo's schema, so a rebuilt database would have come up without it and
+# /api/mb/geo would have degraded exactly as /api/mb/austin/top once did.
+#
+# Every .sql file must be applied by something: ensure_schema() runs
+# schema.sql, the loader runs product_mix.sql, deploy.sh applies whatever it
+# ships. A file nobody references is an index waiting to go missing.
+say "schema file ownership (regression: an index nobody applies)"
+for f in "$REPO"/sql/*.sql; do
+  [[ -f $f ]] || continue
+  base=$(basename "$f")
+  if [[ $base == schema.sql ]]; then
+    ok "$base applied by ensure_schema()"
+    continue
+  fi
+  # Search only the files that can actually apply SQL, and exclude this script:
+  # a first attempt passed because it matched the comment above explaining the
+  # bug, which is the exact failure it was written to catch.
+  found=0
+  for src in "$REPO"/scripts/*.sh "$REPO"/scripts/*.py \
+             "$REPO"/scraper/*.py "$REPO"/api/*.py; do
+    [[ -f $src ]] || continue
+    [[ $src == */check.sh ]] && continue
+    if grep -qF "$base" "$src"; then found=1; break; fi
+  done
+  # A glob such as sql/*.sql counts: deploy.sh ships and applies every .sql it
+  # is given, so a file matched by that pattern has an owner.
+  if ((found == 0)) && grep -qE 'sql/\*\.sql' "$REPO/scripts/deploy.sh" 2>/dev/null; then
+    found=2
+  fi
+  case $found in
+    1) ok "$base applied by name" ;;
+    2) ok "$base applied by deploy.sh (sql/*.sql)" ;;
+    *) bad "$base is applied by nothing"
+       note "fold it into sql/schema.sql, or have deploy.sh ship and apply it" ;;
+  esac
+done
+
 # ------------------------------------------------------------ 5. hygiene
 # refresh.sh is piped into bash on Linux; CRLF makes it die as $'\r'.
 say "file hygiene"
