@@ -254,11 +254,13 @@ function TransitView() {
 function BeverageView() {
   const [data, setData]   = useState(null);
   const [top,  setTop]    = useState(null);
+  const [showAll, setShowAll] = useState(false);
   const [beta, setBeta]   = useState(null);
 
   useEffect(() => {
     fetch("/api/mb/watchlist").then(r => r.json()).then(setData);
-    fetch("/api/mb/austin/top?n=25&months=12").then(r => r.json()).then(setTop);
+    fetch("/api/mb/austin/top?n=100&months=12&with_series=true&series_limit=100")
+      .then(r => r.json()).then(setTop);
     fetch("/api/mb/beta?months=36").then(r => r.json()).then(setBeta);
   }, []);
 
@@ -282,9 +284,16 @@ function BeverageView() {
       </div>
       <MarketBeta data={beta} />
       <section className="card" style={{ marginTop: 20 }}>
-        <h2>Austin · top 25 venues, trailing 12 months</h2>
+        <h2>Austin · top {showAll ? (top?.top?.length ?? 100) : 25} venues, trailing 12 months</h2>
         <div className="sub">By total mixed-beverage gross receipts</div>
-        <TopTable rows={top?.top ?? []} />
+        <TopTable rows={(top?.top ?? []).slice(0, showAll ? undefined : 25)}
+                  months={top?.series_months ?? []} />
+        {(top?.top?.length ?? 0) > 25 && (
+          <button onClick={() => setShowAll(v => !v)}
+                  style={{ marginTop: 12, fontSize: 12 }}>
+            {showAll ? "Show top 25" : `Show all ${top.top.length}`}
+          </button>
+        )}
       </section>
     </>
   );
@@ -560,29 +569,69 @@ function OpsView() {
   );
 }
 
-function TopTable({ rows }) {
+function TopTable({ rows, months = [] }) {
   if (!rows.length) return <div className="empty">No data yet.</div>;
   return (
     <table className="ledger">
       <thead>
         <tr>
           <th>#</th><th>Venue</th><th>Address</th>
+          <th style={{ textAlign: "center" }}>
+            {months.length ? `${months[0]} → ${months.at(-1)}` : "Trend"}
+          </th>
           <th className="r" style={{ textAlign: "right" }}>TTM Receipts</th>
         </tr>
       </thead>
       <tbody>
         {rows.map((r, i) => (
-          <tr key={i}>
+          <tr key={r.location_name ?? i}>
             <td className="mono">{String(i + 1).padStart(2, "0")}</td>
             <td>{r.location_name}</td>
             <td style={{ color: "var(--ink-soft)", fontSize: 12 }}>
               {r.address}
+            </td>
+            <td style={{ padding: "2px 8px" }}>
+              <Sparkline points={r.series} />
             </td>
             <td className="r">{fmtUSD(r.total, { compact: true })}</td>
           </tr>
         ))}
       </tbody>
     </table>
+  );
+}
+
+// A hand-rolled SVG polyline rather than a Recharts chart: one renders per row,
+// and a hundred Recharts instances in a table is far too heavy.
+function Sparkline({ points, width = 110, height = 26 }) {
+  if (!points?.length) return <span style={{ color: "var(--ink-soft)" }}>—</span>;
+  const vals = points.map(p => p.total);
+  const max = Math.max(...vals);
+  const min = Math.min(...vals);
+  // Each line is scaled to its own range, so shape is comparable across rows
+  // but height is not. A flat line means a flat venue, not a small one.
+  const span = max - min || 1;
+  const dx = points.length > 1 ? width / (points.length - 1) : 0;
+  const pad = 3;
+  const y = v => height - pad - ((v - min) / span) * (height - pad * 2);
+  const d = points
+    .map((p, i) => `${i === 0 ? "M" : "L"}${(i * dx).toFixed(1)},${y(p.total).toFixed(1)}`)
+    .join(" ");
+  const last = points.at(-1);
+  const rising = vals.length > 1 && vals.at(-1) >= vals[0];
+  const color = rising ? "#1b7f4f" : "#7A1F1F";
+
+  return (
+    <svg width={width} height={height} role="img"
+         aria-label={`${points.length} months, ${rising ? "rising" : "falling"}`}
+         style={{ display: "block", overflow: "visible" }}>
+      <title>
+        {points.map(p => `${p.ym}: ${Math.round(p.total).toLocaleString()}`).join("\n")}
+      </title>
+      <path d={d} fill="none" strokeWidth="1.4" stroke={color}
+            strokeLinejoin="round" strokeLinecap="round" />
+      <circle cx={(points.length - 1) * dx} cy={y(last.total)} r="2" fill={color} />
+    </svg>
   );
 }
 

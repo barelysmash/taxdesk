@@ -446,6 +446,8 @@ def mb_beta(months: int = Query(36, ge=12, le=120),
 def mb_austin_top(
     n: int = Query(25, ge=1, le=200),
     months: int = Query(12, ge=1, le=60),
+    with_series: bool = Query(False),
+    series_limit: int = Query(25, ge=1, le=100),
 ) -> dict:
     """Top Austin venues by total mixed-beverage receipts over the trailing N months.
 
@@ -480,7 +482,57 @@ def mb_austin_top(
             ORDER BY total DESC
             LIMIT {n}
         """)
-    return {"top": data, "trailing_months": months}
+
+        # Monthly series for the venues just returned, so the table can carry a
+        # trend line without one request per row. A single extra GROUP BY over
+        # the same indexed window; for 100 venues that is ~1,200 rows.
+        series_months: list[str] = []
+        if with_series and data:
+            # Which month is partial has to be decided from the whole table,
+            # not from the selected venues. The top venues have no rows at all
+            # in the newest month — only a couple of early filers do — so
+            # trimming the last month *they* have would drop a complete one.
+            max_ym = conn.execute(
+                "SELECT substr(MAX(obligation_end_date), 1, 7) FROM mixed_beverage"
+            ).fetchone()[0]
+            if max_ym:
+                y, mo = int(max_ym[:4]), int(max_ym[5:7])
+                idx = y * 12 + (mo - 1) - 1          # step back off the partial month
+                # Built in Python rather than with SQLite date arithmetic:
+                # date('2026-07-31', '-13 months') lands on 2025-07-01, because
+                # 2025-06-31 does not exist and SQLite rolls it forward.
+                series_months = [
+                    f"{(idx - k) // 12:04d}-{(idx - k) % 12 + 1:02d}"
+                    for k in reversed(range(months))
+                ]
+
+            if series_months:
+                names = [r["location_name"] for r in data[:series_limit]]
+                marks = ",".join("?" * len(names))
+                mmarks = ",".join("?" * len(series_months))
+                srows = rows(conn, f"""
+                    SELECT location_name,
+                           substr(obligation_end_date, 1, 7) AS ym,
+                           SUM(total_receipts) AS total
+                    FROM mixed_beverage
+                    WHERE upper(location_city) = 'AUSTIN'
+                      AND location_name IN ({marks})
+                      AND substr(obligation_end_date, 1, 7) IN ({mmarks})
+                    GROUP BY location_name, ym
+                """, tuple(names) + tuple(series_months))
+
+                byname: dict[str, dict[str, float]] = {}
+                for r in srows:
+                    byname.setdefault(r["location_name"], {})[r["ym"]] = float(r["total"] or 0)
+                for r in data:
+                    sm = byname.get(r["location_name"])
+                    # A venue absent in a month filed nothing, which is a real
+                    # zero rather than missing data, so the line stays whole.
+                    r["series"] = ([{"ym": m, "total": round(sm.get(m, 0.0), 2)}
+                                    for m in series_months] if sm else [])
+
+    return {"top": data, "trailing_months": months,
+            "series_months": series_months if with_series and data else []}
 
 
 

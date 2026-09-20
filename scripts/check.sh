@@ -77,10 +77,43 @@ fi
 grep -q 'fromDate=' "$SCRAPE"      && ok "date-range pagination present"          || bad "date-range pagination missing"
 grep -q 'ytd_yoy_pct' "$SCRAPE"    && ok "ytd_yoy_pct populated"                  || bad "ytd_yoy_pct not written"
 
+# ------------------------------------------------------- 2b. feature survival
+# Patches written against a stale copy of the tree have silently reverted work
+# three times: the lookback window, the watchlist seed, and — caught in the
+# working tree rather than by this script — the whole GeoPanel. Naming every
+# endpoint and panel makes that class of revert impossible to commit.
+#
+# When you add an endpoint or a panel, add it here. The cost is one line; the
+# thing it prevents is deleting someone's feature and not noticing.
+say "feature survival (regression: a stale-base patch deletes a feature)"
+for ep in \
+  "/api/health" "/api/sales-tax/city" "/api/sales-tax/city/yoy" \
+  "/api/sales-tax/county" "/api/sales-tax/statewide" \
+  "/api/mb/watchlist" "/api/mb/venue/{slug}" "/api/mb/austin/top" \
+  "/api/mb/beta" "/api/mb/geo" "/api/mix/periods" "/api/mix/groups"
+do
+  if grep -qF "@app.get(\"$ep\")" "$MAIN"; then
+    ok "endpoint $ep"
+  else
+    bad "endpoint $ep is MISSING from api/main.py"
+    note "a patch built on an older copy of the file would do exactly this"
+  fi
+done
+
+APP="$REPO/web/src/App.jsx"
+if [[ -f $APP ]]; then
+  for comp in GeoPanel MarketBeta OpsView YoYHeatmap Sparkline; do
+    grep -q "$comp" "$APP" && ok "panel $comp" || bad "panel $comp is MISSING from App.jsx"
+  done
+else
+  note "App.jsx not found, panel checks skipped"
+fi
+
 # ------------------------------------------------------------ 3. hot query
 # 1baef13. 180s -> 23ms. Both halves matter: the scalar subquery and the
 # expression index. Either one reverting brings the stall back.
 say "hot query (regression: /api/mb/austin/top hangs, stalls the single worker)"
+HAVE_SCHEMA=1; [[ -f $SCHEMA ]] || { HAVE_SCHEMA=0; note "schema.sql not present, schema checks skipped"; }
 grep -q '(SELECT d FROM cutoff)' "$MAIN" && ok "cutoff is a scalar subquery" || { bad "cutoff is not a scalar subquery"; note "FROM mixed_beverage, cutoff re-drives the CTE: 23ms -> 180s"; }
 # The docstring mentions the old form on purpose, so only flag it inside SQL.
 if grep -q '^\s*FROM mixed_beverage, cutoff' "$MAIN"; then
@@ -88,13 +121,20 @@ if grep -q '^\s*FROM mixed_beverage, cutoff' "$MAIN"; then
 else
   ok "no cross join to cutoff"
 fi
-grep -q 'idx_mb_upper_city_date' "$SCHEMA" && ok "expression index declared in schema.sql" || bad "idx_mb_upper_city_date missing from schema.sql"
-grep -q 'idx_mb_city_date_total' "$SCHEMA" && ok "idx_mb_city_date_total declared"          || bad "idx_mb_city_date_total missing from schema.sql"
+if ((HAVE_SCHEMA)); then
+  grep -q 'idx_mb_upper_city_date' "$SCHEMA" && ok "expression index declared in schema.sql" || bad "idx_mb_upper_city_date missing from schema.sql"
+fi
+if ((HAVE_SCHEMA)); then
+  grep -q 'idx_mb_city_date_total' "$SCHEMA" && ok "idx_mb_city_date_total declared" || bad "idx_mb_city_date_total missing from schema.sql"
+fi
 
 # ------------------------------------------------------------ 4. watchlist
 # 9b15112. Trailing '%' patterns matched unrelated venues and inflated totals.
 # Reverted once by a schema.sql built from a stale base.
 say "watchlist (regression: peer totals silently inflated)"
+if [[ ! -f $SCHEMA ]]; then
+  note "schema.sql not present, watchlist checks skipped"
+else
 # Uses python's sqlite3 module, not the sqlite3 CLI: Git Bash on Windows does
 # not ship the CLI, so the original version skipped this whole section — the
 # exact checks that would have caught the stale-base schema.sql revert — while
@@ -145,6 +185,8 @@ else
     [[ -z ${verdict:-} ]] && continue
     if [[ $verdict == PASS ]]; then ok "$msg"; else bad "$msg"; [[ -n ${hint:-} ]] && note "$hint"; fi
   done <<<"$wl_out"
+fi
+
 fi
 
 # ------------------------------------------------------------ 5. hygiene
