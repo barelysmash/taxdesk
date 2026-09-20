@@ -3,10 +3,13 @@
 
     python scripts/load_mix.py ProductMix_2025-08-12_2026-08-12.xlsx
     python scripts/load_mix.py export.xlsx --service-days 312
-    python scripts/load_mix.py export.xlsx --dry-run
+    python scripts/load_mix.py All_levels.csv --start 2026-09-19 --service-days 1
 
-The period comes from the filename (ProductMix_START_END.xlsx). Override it
-with --start and --end if the file has been renamed.
+Accepts either an xlsx workbook or the All_levels.csv that the same Toast
+report exports. The CSV carries the whole hierarchy in one file but no dates at
+all, so --start is required for it; --end defaults to the day after --start.
+
+The period otherwise comes from the filename (ProductMix_START_END.xlsx).
 
 Idempotent: every row is INSERT OR REPLACE against a natural key, so reloading
 the same export changes nothing. Loading an overlapping period does NOT merge —
@@ -21,11 +24,12 @@ from __future__ import annotations
 import argparse
 import logging
 import os
+import csv as csvmod
 import re
 import sqlite3
 import sys
 from contextlib import closing
-from datetime import date
+from datetime import date, timedelta
 from pathlib import Path
 
 try:
@@ -59,11 +63,13 @@ SHEETS = {
     "Items": "item",
 }
 
+# Toast spells the item column differently between the workbook and the CSV,
+# and the CSV header carries an embedded newline ("Item\n open item").
 COLS = {
     "menu": "Menu",
     "menu_group": "Menu group",
     "subgroup": "Subgroup",
-    "item": "Item",
+    "item": ("Item", "Item\n open item", "Item, open item"),
     "qty_sold": "Qty sold",
     "gross_amt": "Gross item amt",
     "net_amt": "Net item amt",
@@ -74,10 +80,52 @@ COLS = {
 def parse_period(path: Path, start: str | None, end: str | None) -> tuple[str, str]:
     if start and end:
         return start, end
+    if start:
+        # A single day: end is exclusive, so it is the next morning.
+        return start, (date.fromisoformat(start) + timedelta(days=1)).isoformat()
     m = re.search(r"(\d{4}-\d{2}-\d{2})[_-](\d{4}-\d{2}-\d{2})", path.name)
     if not m:
-        sys.exit(f"cannot read a period from {path.name!r}; pass --start and --end")
+        sys.exit(f"cannot read a period from {path.name!r}; pass --start "
+                 f"(and --end for a range longer than one day)")
     return m.group(1), m.group(2)
+
+
+def _map_columns(head: list[str]) -> dict[str, int]:
+    """Locate our columns in a header row, tolerating Toast's naming variants."""
+    norm = [re.sub(r"\s+", " ", h).strip().lower() for h in head]
+    idx = {}
+    for key, labels in COLS.items():
+        for label in (labels if isinstance(labels, tuple) else (labels,)):
+            want = re.sub(r"\s+", " ", label).strip().lower()
+            if want in norm:
+                idx[key] = norm.index(want)
+                break
+    return idx
+
+
+def read_csv(path: Path) -> list[dict]:
+    """Read All_levels.csv, which holds every level of the hierarchy at once."""
+    with path.open(newline="", encoding="utf-8-sig") as fh:
+        raw = list(csvmod.reader(fh))
+    if not raw:
+        return []
+    idx = _map_columns(raw[0])
+    if "menu" not in idx:
+        sys.exit(f"{path.name} has no Menu column; is this an All_levels export?")
+    out = []
+    for r in raw[1:]:
+        rec = {}
+        for key, i in idx.items():
+            v = r[i] if i < len(r) else ""
+            rec[key] = num(v) if key in ("qty_sold", "gross_amt", "net_amt", "discount_amt") \
+                else (v or "").strip()
+        if not any((rec.get("menu"), rec.get("menu_group"),
+                    rec.get("subgroup"), rec.get("item"))):
+            continue
+        if rec.get("gross_amt") is None and rec.get("qty_sold") is None:
+            continue
+        out.append(rec)
+    return out
 
 
 def num(v):
@@ -101,10 +149,7 @@ def read_sheet(wb, sheet: str) -> list[dict]:
     if not rows:
         return []
     head = [str(h).strip() if h is not None else "" for h in rows[0]]
-    idx = {}
-    for key, label in COLS.items():
-        if label in head:
-            idx[key] = head.index(label)
+    idx = _map_columns(head)
     out = []
     for raw in rows[1:]:
         rec = {}
@@ -131,9 +176,17 @@ def pick_level_rows(rows: list[dict], level: str) -> list[dict]:
     both under one level would double the money.
     """
     if level == "menu":
-        return [r for r in rows if r.get("menu")]
+        # In the workbook each level has its own sheet, so "has a menu" is
+        # enough. In All_levels.csv every row carries its full ancestry, so the
+        # test must also require that nothing below the menu is filled in —
+        # otherwise every row in the file counts as a menu total and the money
+        # is summed several times over.
+        return [r for r in rows
+                if r.get("menu") and not r.get("menu_group")
+                and not r.get("subgroup") and not r.get("item")]
     if level == "group":
-        return [r for r in rows if r.get("menu_group") and not r.get("subgroup")]
+        return [r for r in rows
+                if r.get("menu_group") and not r.get("subgroup") and not r.get("item")]
     if level == "subgroup":
         return [r for r in rows if r.get("subgroup") and not r.get("item")]
     if level == "item":
@@ -164,11 +217,19 @@ def main() -> int:
     start, end = parse_period(args.export, args.start, args.end)
     LOG.info("period %s to %s", start, end)
 
-    wb = load_workbook(args.export, read_only=True, data_only=True)
     staged: list[tuple] = []
-    for sheet, level in SHEETS.items():
-        rows = pick_level_rows(read_sheet(wb, sheet), level)
-        LOG.info("%-12s -> level %-9s %5d rows", sheet, level, len(rows))
+    if args.export.suffix.lower() == ".csv":
+        table = read_csv(args.export)
+        LOG.info("%s: %d rows across all levels", args.export.name, len(table))
+        sources = [(args.export.name, lvl, table)
+                   for lvl in ("menu", "group", "subgroup", "item")]
+    else:
+        wb = load_workbook(args.export, read_only=True, data_only=True)
+        sources = [(sheet, lvl, read_sheet(wb, sheet)) for sheet, lvl in SHEETS.items()]
+
+    for label, level, table in sources:
+        rows = pick_level_rows(table, level)
+        LOG.info("%-14s -> level %-9s %5d rows", label[:14], level, len(rows))
         for r in rows:
             staged.append((
                 start, end, level,
